@@ -10,7 +10,8 @@
   "license": "AGPL-3.0",
 
   "host_application": {
-    "min_version": "0.11.0"
+    "min_version": "0.11.0",
+    "max_version": "0.11.0"
   },
   "homepage_url": "https://github.com/TAIY2020/group_muter_plugin",
     "repository_url": "https://github.com/TAIY2020/group_muter_plugin",
