@@ -1,14 +1,4 @@
-<!--
- * @Author       : TAIY2020
- * @Date         : 2025-10-19 20:02:50
- * @LastEditors  : TAIY2020
- * @LastEditTime : 2025-11-05 17:03:29
- * @FilePath     : \\Coding\\git\\group_muter_plugin\\README.md
- * @Descripttion :
- * @version      : 1.0.0
--->
-
-# GroupMuter 插件
+# 群聊静音插件 (GroupMuterPlugin)
 
 🤫 **一个允许管理员通过聊天命令，让麦麦在指定群聊中临时进入“静音状态”的群组管理插件。**
 
