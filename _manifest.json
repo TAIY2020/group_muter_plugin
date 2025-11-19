@@ -11,7 +11,7 @@
 
   "host_application": {
     "min_version": "0.11.0",
-    "max_version": "0.11.2"
+    "max_version": "0.11.4"
   },
   "homepage_url": "https://github.com/TAIY2020/group_muter_plugin",
     "repository_url": "https://github.com/TAIY2020/group_muter_plugin",
