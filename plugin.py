@@ -1,5 +1,4 @@
 import time
-import asyncio
 import logging
 import re
 from typing import List, Tuple, Type, Dict, Optional, Set
@@ -79,27 +78,36 @@ class MuteEventInterceptor(BaseEventHandler):
     weight = 10000
     intercept_message = True
 
-    async def execute(self, message: MaiMessages) -> Tuple[bool, bool, Optional[str], None, None]:
+    async def execute(self, message: Optional[MaiMessages]) -> Tuple[bool, bool, Optional[str], None, None]:
+        if not message:
+            return True, True, None, None, None
+
         if not message.is_group_message:
             return True, True, "非群聊消息，放行", None, None
 
         info = message.message_base_info
         platform, group_id = str(info.get("platform", "")), str(
             info.get("group_id", ""))
+
+        # 检查是否处于静音状态
         if not platform or not group_id or not MuteStatus.is_muted(platform, group_id):
             return True, True, "非静音群聊，放行", None, None
 
         user_id = str(info.get("user_id", ""))
         is_admin = GroupMuterPlugin.check_permission(
             user_id, self.plugin_config)
+
+        # 如果不是管理员，拦截消息
         if not is_admin:
             MuteStatus.log_summary(platform, group_id)
             return True, False, "静音中，非管理员消息已拦截", None, None
 
+        # 检查关键词唤醒
         unmute_keywords = self.get_config("mute.unmute_keywords", [])
         if self.get_config("mute.enable_unmute", True) and _is_keyword_in_text(message.plain_text or "", unmute_keywords):
             return True, True, "管理员解除指令，放行给Command处理", None, None
 
+        # 检查@唤醒
         if self.get_config("mute.at_mention_break", True) and is_bot_mentioned(message):
             MuteStatus.clear_mute(platform, group_id)
             logger.info(f"管理员({user_id})通过'@提及'操作解除了群({group_id})的静音。")
@@ -109,8 +117,6 @@ class MuteEventInterceptor(BaseEventHandler):
         return True, False, "静音中，管理员普通消息已拦截", None, None
 
 # --- 命令组件 ---
-
-
 class MuteCommand(BaseCommand):
     command_name = "mute"
     command_description = "让麦麦进入静音模式"
@@ -204,7 +210,7 @@ class GroupMuterPlugin(BasePlugin):
     config_schema: Dict = {
         "plugin": {
             "name": ConfigField(type=str, default="group_muter_plugin", description="插件名称"),
-            "version": ConfigField(type=str, default="1.3.0", description="插件版本"),
+            "version": ConfigField(type=str, default="1.3.2", description="插件版本"),
             "enabled": ConfigField(type=bool, default=True, description="是否启用此插件"),
         },
         "mute": {
