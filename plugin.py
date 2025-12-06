@@ -12,6 +12,7 @@ from src.plugin_system import (
     EventType,
     ConfigField,
     MaiMessages,
+    CustomEventHandlerResult,
     config_api,
 )
 from src.common.logger import get_logger
@@ -78,7 +79,7 @@ class MuteEventInterceptor(BaseEventHandler):
     weight = 10000
     intercept_message = True
 
-    async def execute(self, message: Optional[MaiMessages]) -> Tuple[bool, bool, Optional[str], None, None]:
+    async def execute(self, message: Optional[MaiMessages]) -> Tuple[bool, bool, Optional[str], Optional[CustomEventHandlerResult], Optional[MaiMessages]]:
         if not message:
             return True, True, None, None, None
 
@@ -122,15 +123,15 @@ class MuteCommand(BaseCommand):
     command_description = "让麦麦进入静音模式"
     command_pattern = ""
 
-    async def execute(self) -> Tuple[bool, Optional[str], bool]:
+    async def execute(self) -> Tuple[bool, Optional[str], int]:
         if not self.message.chat_stream.group_info:
-            return False, "该命令仅在群聊中有效。", True
+            return False, "该命令仅在群聊中有效。", 1
 
         user_id = str(self.message.chat_stream.user_info.user_id)
         if not GroupMuterPlugin.check_permission(user_id, self.plugin_config):
             logger.warning(f"用户 {user_id} 尝试执行静音命令失败：权限不足。")
             await self.send_text("？？？你在教我做事🤡")
-            return False, "权限不足", True
+            return False, "权限不足", 2
 
         platform = self.message.chat_stream.platform
         group_id = str(self.message.chat_stream.group_info.group_id)
@@ -139,7 +140,7 @@ class MuteCommand(BaseCommand):
 
         MuteStatus.set_mute(platform, group_id, duration, group_name)
         await self.send_text("好吧，那我去看会书📘，你们先聊...")
-        return True, f"已为群聊 {group_name or group_id} 开启静音模式，持续 {duration} 秒。", True
+        return True, f"已为群聊 {group_name or group_id} 开启静音模式，持续 {duration} 秒。", 2
 
 
 class UnmuteCommand(BaseCommand):
@@ -147,14 +148,14 @@ class UnmuteCommand(BaseCommand):
     command_description = "让麦麦解除静音模式"
     command_pattern = ""
 
-    async def execute(self) -> Tuple[bool, Optional[str], bool]:
+    async def execute(self) -> Tuple[bool, Optional[str], int]:
         if not self.message.chat_stream.group_info:
-            return False, "该命令仅在群聊中有效。", True
+            return False, "该命令仅在群聊中有效。", 1
 
         user_id = str(self.message.chat_stream.user_info.user_id)
         if not GroupMuterPlugin.check_permission(user_id, self.plugin_config):
             logger.warning(f"用户 {user_id} 尝试执行解除静音命令失败：权限不足。")
-            return False, "权限不足", True
+            return False, "权限不足", 2
 
         platform = self.message.chat_stream.platform
         group_id = str(self.message.chat_stream.group_info.group_id)
@@ -162,7 +163,7 @@ class UnmuteCommand(BaseCommand):
 
         MuteStatus.clear_mute(platform, group_id)
         await self.send_text("我回来啦，你们聊啥呢🤔")
-        return True, f"已为群聊 {group_name or group_id} 解除静音模式。", True
+        return True, f"已为群聊 {group_name or group_id} 解除静音模式。", 2
 
 # --- 日志过滤器 ---
 class GroupMuterLogFilter(logging.Filter):
@@ -209,20 +210,39 @@ class GroupMuterPlugin(BasePlugin):
 
     config_schema: Dict = {
         "plugin": {
-            "name": ConfigField(type=str, default="group_muter_plugin", description="插件名称"),
-            "version": ConfigField(type=str, default="1.3.2", description="插件版本"),
-            "enabled": ConfigField(type=bool, default=True, description="是否启用此插件"),
+            "name": ConfigField(type=str, default="group_muter_plugin", description="插件名称", disabled=True),
+            "version": ConfigField(type=str, default="1.4.0", description="插件版本", disabled=True),
+            "enabled": ConfigField(type=bool, default=True, description="是否启用此插件", label="启用插件"),
         },
         "mute": {
-            "duration_seconds": ConfigField(type=int, default=1200, description="静音持续时间（秒)"),
-            "mute_keywords": ConfigField(type=list, default=["Mute True", "安安你去看书去"], description="触发静音的关键词列表"),
-            "unmute_keywords": ConfigField(type=list, default=["Mute False", "安安别看了"], description="解除静音的关键词列表"),
-            "enable_unmute": ConfigField(type=bool, default=True, description="是否启用 '解除静音' 关键词指令"),
-            "at_mention_break": ConfigField(type=bool, default=True, description="管理员@麦麦时是否自动解除静音"),
+            "duration_seconds": ConfigField(
+                type=int, default=1200, description="静音持续时间（秒)",
+                label="静音时长(秒)", input_type="number", min=60
+            ),
+            "mute_keywords": ConfigField(
+                type=list, default=["Mute True", "安安你去看书去"], description="触发静音的关键词列表",
+                label="静音触发词", input_type="list"
+            ),
+            "unmute_keywords": ConfigField(
+                type=list, default=["Mute False", "安安别看了"], description="解除静音的关键词列表",
+                label="解除静音触发词", input_type="list"
+            ),
+            "enable_unmute": ConfigField(
+                type=bool, default=True, description="是否启用 '解除静音' 关键词指令", label="启用关键词解除"
+            ),
+            "at_mention_break": ConfigField(
+                type=bool, default=True, description="管理员@麦麦时是否自动解除静音", label="允许@解除静音"
+            ),
         },
         "user_control": {
-            "list_type": ConfigField(type=str, default="whitelist", description="权限列表类型", choices=["whitelist", "blacklist"]),
-            "list": ConfigField(type=list, default=[], description="拥有权限的用户QQ号列表"),
+            "list_type": ConfigField(
+                type=str, default="whitelist", description="权限列表类型",
+                label="名单类型", choices=["whitelist", "blacklist"]
+            ),
+            "list": ConfigField(
+                type=list, default=[], description="拥有权限的用户QQ号列表",
+                label="用户列表", input_type="list"
+            ),
         },
     }
 
@@ -261,7 +281,9 @@ class GroupMuterPlugin(BasePlugin):
 
         user_control_config = config.get("user_control", {})
         list_type = user_control_config.get("list_type", "whitelist")
-        user_list = {str(u) for u in user_control_config.get("list", [])}
+        user_list_raw = user_control_config.get("list", [])
+        user_list = {str(u) for u in user_list_raw} if user_list_raw else set()
+
         if list_type == "whitelist":
             return user_id in user_list
         if list_type == "blacklist":
