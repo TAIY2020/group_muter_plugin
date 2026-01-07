@@ -211,7 +211,7 @@ class GroupMuterPlugin(BasePlugin):
     config_schema: Dict = {
         "plugin": {
             "name": ConfigField(type=str, default="group_muter_plugin", description="插件名称", disabled=True),
-            "version": ConfigField(type=str, default="1.4.0", description="插件版本", disabled=True),
+            "version": ConfigField(type=str, default="1.4.2", description="插件版本", disabled=True),
             "enabled": ConfigField(type=bool, default=True, description="是否启用此插件", label="启用插件"),
         },
         "mute": {

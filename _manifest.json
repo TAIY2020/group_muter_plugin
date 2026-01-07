@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "群聊静音插件 (GroupMuterPlugin)",
-  "version": "1.4.0",
+  "version": "1.4.2",
   "description": "一个允许管理员通过聊天命令，让麦麦在指定群聊中临时进入“静音状态”的群组管理插件。",
   "author": {
         "name": "TaiYang",
