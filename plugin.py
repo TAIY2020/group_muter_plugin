@@ -216,32 +216,58 @@ class GroupMuterPlugin(BasePlugin):
         },
         "mute": {
             "duration_seconds": ConfigField(
-                type=int, default=1200, description="静音持续时间（秒)",
-                label="静音时长(秒)", input_type="number", min=60
+                type=int,
+                default=1200,
+                description="静音持续时间（秒)",
+                label="静音时长(秒)",
+                input_type="number",
+                min=60,
+                max=86400,
+                step=60
             ),
             "mute_keywords": ConfigField(
-                type=list, default=["Mute True", "安安你去看书去"], description="触发静音的关键词列表",
-                label="静音触发词", input_type="list"
+                type=list,
+                default=["Mute True", "安安你去看书去"],
+                description="触发静音的关键词列表",
+                label="静音触发词",
+                input_type="list"
             ),
             "unmute_keywords": ConfigField(
-                type=list, default=["Mute False", "安安别看了"], description="解除静音的关键词列表",
-                label="解除静音触发词", input_type="list"
+                type=list,
+                default=["Mute False", "安安别看了"],
+                description="解除静音的关键词列表",
+                label="解除静音触发词",
+                input_type="list"
             ),
             "enable_unmute": ConfigField(
-                type=bool, default=True, description="是否启用 '解除静音' 关键词指令", label="启用关键词解除"
+                type=bool,
+                default=True,
+                description="是否启用 '解除静音' 关键词指令",
+                label="启用关键词解除",
+                input_type="checkbox"
             ),
             "at_mention_break": ConfigField(
-                type=bool, default=True, description="管理员@麦麦时是否自动解除静音", label="允许@解除静音"
+                type=bool,
+                default=True,
+                description="管理员@麦麦时是否自动解除静音",
+                label="允许@解除静音",
+                input_type="checkbox"
             ),
         },
         "user_control": {
             "list_type": ConfigField(
-                type=str, default="whitelist", description="权限列表类型",
-                label="名单类型", choices=["whitelist", "blacklist"]
+                type=str,
+                default="whitelist",
+                description="权限列表类型",
+                label="名单类型",
+                choices=["whitelist", "blacklist"]
             ),
             "list": ConfigField(
-                type=list, default=[], description="拥有权限的用户QQ号列表",
-                label="用户列表", input_type="list"
+                type=list,
+                default=[],
+                description="拥有权限的用户QQ号列表",
+                label="用户列表",
+                input_type="list"
             ),
         },
     }
