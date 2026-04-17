@@ -101,7 +101,7 @@ list = []
 ### 配置项说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
+| ------ | ---- | ------ | ---- |
 | `mute.duration_seconds` | int | `1200` | 静音持续时间（秒），范围 60 ~ 86400 |
 | `mute.mute_keywords` | list | `["Mute True", "安安你去看书去"]` | 触发静音的关键词列表 |
 | `mute.unmute_keywords` | list | `["Mute False", "安安别看了"]` | 解除静音的关键词列表 |
@@ -119,7 +119,7 @@ list = []
 v2.0.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
 | 项目 | v1.x (旧版) | v2.0.0 (新版) |
-|------|-------------|---------------|
+| ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
 | 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (入站 + 出站双重拦截) |
 | 配置管理 | `config_schema` 字典 + `ConfigField` | `PluginConfigBase` 强类型模型 (Pydantic) |
