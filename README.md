@@ -4,7 +4,7 @@
 
 这个插件为群组管理员提供了一个强大的工具来让麦麦“静音”。当群聊需要专注讨论或减少麦麦干扰时，管理员可以一键“静音”麦麦。在静音模式下，麦麦将忽略所有消息，直到被管理员唤醒或到达静音时间自动解除静音。
 
-> 本版本 (v2.0.0) 基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本 (v2.1.0) 基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -16,7 +16,7 @@
   - **命令唤醒**: 管理员使用特定关键词即可主动唤醒。
   - **@提及唤醒**: 管理员在群里 `@` 麦麦，即可立即唤醒麦麦。
   - **自动解除**: 静音时间到达后，麦麦将自动解除静音，恢复正常聊天。
-- **高度可配置**: 静音时长、触发关键词均可在配置文件或 Web UI 中轻松修改。
+- **高度可配置**: 静音时长、触发关键词、麦麦的回复语均可在配置文件或 Web UI 中轻松修改。
 - **配置热重载**: 通过 Web UI 修改配置后无需重启，插件会自动应用新配置。
 
 ---
@@ -42,8 +42,8 @@
 ```toml
 [plugin]
 name = "group_muter_plugin"
-version = "2.0.0"
-config_version = "2.0.0"
+version = "2.1.0"
+config_version = "2.1.0"
 enabled = true
 
 [mute]
@@ -52,6 +52,9 @@ mute_keywords = ["Mute True", "安安你去看书去"]
 unmute_keywords = ["Mute False", "安安别看了"]
 enable_unmute = true
 at_mention_break = true
+mute_reply = "好吧，那我去看会书📘，你们先聊..."
+unmute_reply = "我回来啦，你们聊啥呢🤔"
+no_permission_reply = "？？？你在教我做事🤡"
 
 [user_control]
 list_type = "whitelist"
@@ -74,8 +77,8 @@ list = []
 管理员在群聊中发送配置的静音关键词即可开启静音模式。
 
 - **默认关键词**: `Mute True` 或 `安安你去看书去`
-- **麦麦回复**: `好吧，那我去看会书📘，你们先聊...`
-- **非管理员尝试**: 麦麦会回复 `？？？你在教我做事🤡` 并拒绝操作。
+- **麦麦回复**: 由 `mute.mute_reply` 配置（默认 `好吧，那我去看会书📘，你们先聊...`）
+- **非管理员尝试**: 麦麦会回复 `mute.no_permission_reply`（默认 `？？？你在教我做事🤡`）并拒绝操作。
 
 ### 解除静音
 
@@ -86,13 +89,13 @@ list = []
 管理员发送配置的解除关键词。
 
 - **默认关键词**: `Mute False` 或 `安安别看了`
-- **麦麦回复**: `我回来啦，你们聊啥呢🤔`
+- **麦麦回复**: 由 `mute.unmute_reply` 配置（默认 `我回来啦，你们聊啥呢🤔`）
 
 #### 方式二：@提及解除
 
 管理员在群里 `@` 麦麦，即可立即解除静音。
 
-- **麦麦回复**: `我回来啦，你们聊啥呢🤔`
+- **麦麦回复**: 同样使用 `mute.unmute_reply`
 
 #### 方式三：自动超时解除
 
@@ -107,6 +110,9 @@ list = []
 | `mute.unmute_keywords` | list | `["Mute False", "安安别看了"]` | 解除静音的关键词列表 |
 | `mute.enable_unmute` | bool | `true` | 是否启用关键词解除功能 |
 | `mute.at_mention_break` | bool | `true` | 管理员 @麦麦 时是否自动解除静音 |
+| `mute.mute_reply` | str | `好吧，那我去看会书📘，你们先聊...` | 开启静音时麦麦的回复语 |
+| `mute.unmute_reply` | str | `我回来啦，你们聊啥呢🤔` | 解除静音时麦麦的回复语（@解除与关键词解除共用） |
+| `mute.no_permission_reply` | str | `？？？你在教我做事🤡` | 非管理员尝试触发静音时的拒绝回复 |
 
 #### 命令示例
 
@@ -116,7 +122,7 @@ list = []
 
 ## 🔄 从 v1.x 升级
 
-v2.0.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
+v2.1.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
 | 项目 | v1.x (旧版) | v2.0.0 (新版) |
 | ---- | ----------- | ------------- |
@@ -129,7 +135,7 @@ v2.0.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 | 发送豁免 | 无 | 内置豁免机制，确保插件自身的控制消息不被拦截 |
 | 清单文件 | `manifest_version: 1` | `manifest_version: 2`，新增 `capabilities`、`i18n` 等字段 |
 
-**配置兼容性**: `config.toml` 配置结构基本保持一致，新增 `config_version` 字段，可直接迁移使用。
+**配置兼容性**: `config.toml` 配置结构基本保持一致，新增 `config_version` 字段，可直接迁移使用。新增的 `mute_reply` / `unmute_reply` / `no_permission_reply` 三个字段会使用代码内的默认值，无需手动改动旧配置。
 
 ---
 

@@ -25,6 +25,9 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger("plugin.group_muter")
 
+# 预编译正则：匹配 CQ at 码或 @前缀
+_AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
+
 
 # --- 配置模型 ---
 
@@ -39,12 +42,12 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"disabled": True}
     )
     version: str = Field(
-        default="2.0.0",
+        default="2.1.0",
         description="插件版本",
         json_schema_extra={"disabled": True}
     )
     config_version: str = Field(
-        default="2.0.0",
+        default="2.1.0",
         description="配置文件版本",
         json_schema_extra={"disabled": True}
     )
@@ -93,6 +96,21 @@ class MuteSection(PluginConfigBase):
         default=True,
         description="管理员 @麦麦 时是否自动解除静音",
         json_schema_extra={"label": "允许@解除静音"}
+    )
+    mute_reply: str = Field(
+        default="好吧，那我去看会书📘，你们先聊...",
+        description="管理员开启静音时麦麦的回复语",
+        json_schema_extra={"label": "开启静音回复语"},
+    )
+    unmute_reply: str = Field(
+        default="我回来啦，你们聊啥呢🤔",
+        description="管理员解除静音时麦麦的回复语（@解除与关键词解除共用）",
+        json_schema_extra={"label": "解除静音回复语"},
+    )
+    no_permission_reply: str = Field(
+        default="？？？你在教我做事🤡",
+        description="非管理员尝试触发静音时麦麦的拒绝回复语",
+        json_schema_extra={"label": "拒绝权限回复语"},
     )
 
 
@@ -264,7 +282,7 @@ class MuteStatus:
 
 def _strip_at_prefix(text: str) -> str:
     """去除文本中的 CQ at 码和 @前缀。"""
-    return re.sub(r"\[CQ:at,[^\]]+\]|@\S+", "", text).strip()
+    return _AT_PREFIX_PATTERN.sub("", text).strip()
 
 
 def _is_keyword_in_text(text: str, keywords: List[str]) -> bool:
@@ -353,7 +371,7 @@ class GroupMuterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._user_set = {str(u) for u in self.config.user_control.list}
-        logger.info("群聊静音插件(v2.0.0)初始化完成。")
+        logger.info("群聊静音插件(v2.1.0)初始化完成。")
 
     async def on_unload(self) -> None:
         """插件卸载时清理所有静音状态和后台任务。"""
@@ -474,10 +492,10 @@ class GroupMuterPlugin(MaiBotPlugin):
                     duration = self.config.mute.duration_seconds
                     MuteStatus.set_mute(group_id, duration, group_name or None)
                     MuteStatus.set_send_exempt(group_id, 5.0)
-                    await self.ctx.send.text("好吧，那我去看会书📘，你们先聊...", stream_id)
+                    await self.ctx.send.text(self.config.mute.mute_reply, stream_id)
                     return {"action": "abort"}
                 else:
-                    await self.ctx.send.text("？？？你在教我做事🤡", stream_id)
+                    await self.ctx.send.text(self.config.mute.no_permission_reply, stream_id)
                     return {"action": "abort"}
             # 普通消息，放行
             return None
@@ -496,14 +514,14 @@ class GroupMuterPlugin(MaiBotPlugin):
         if is_admin and self.config.mute.at_mention_break and bot_mentioned:
             MuteStatus.set_send_exempt(group_id, 5.0)
             MuteStatus.clear_mute(group_id)
-            await self.ctx.send.text("我回来啦，你们聊啥呢🤔", stream_id)
+            await self.ctx.send.text(self.config.mute.unmute_reply, stream_id)
             return {"action": "abort"}
 
         # 管理员 + 解除关键词 → 解除
         if is_admin and self.config.mute.enable_unmute and _is_keyword_in_text(plain_text, self.config.mute.unmute_keywords):
             MuteStatus.set_send_exempt(group_id, 5.0)
             MuteStatus.clear_mute(group_id)
-            await self.ctx.send.text("我回来啦，你们聊啥呢🤔", stream_id)
+            await self.ctx.send.text(self.config.mute.unmute_reply, stream_id)
             return {"action": "abort"}
 
         # 其他所有消息一律拦截，打印剩余时间
