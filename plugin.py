@@ -15,12 +15,13 @@
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
+from pydantic import field_validator
 
 import asyncio
 import logging
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 
 logger = logging.getLogger("plugin.group_muter")
@@ -119,16 +120,30 @@ class UserControlSection(PluginConfigBase):
 
     __ui_label__ = "权限控制"
 
-    list_type: str = Field(
+    list_type: Literal["whitelist", "blacklist"] = Field(
         default="whitelist",
         description="权限列表类型：whitelist 或 blacklist",
-        json_schema_extra={"label": "名单类型", "x-widget": "select", "options": [{"label": "白名单", "value": "whitelist"}, {"label": "黑名单", "value": "blacklist"}]},
+        json_schema_extra={
+            "label": "名单类型",
+            "hint": "白名单模式只允许列表内用户操作，黑名单模式则禁止列表内用户操作。",
+        },
     )
     list: List[str] = Field(
         default=[],
         description="拥有权限的用户 QQ 号列表",
         json_schema_extra={"label": "用户列表", "hint": "填写 QQ 号，如 [\"123456\"]"},
     )
+
+    @field_validator("list_type", mode="before")
+    @classmethod
+    def _normalize_list_type(cls, value: Any) -> Literal["whitelist", "blacklist"]:
+        """规范化名单类型字段，对非法值兜底回退到默认值。"""
+        normalized = "" if value is None else str(value).strip().lower()
+        if normalized == "whitelist":
+            return "whitelist"
+        if normalized == "blacklist":
+            return "blacklist"
+        return "whitelist"
 
 
 class GroupMuterConfig(PluginConfigBase):
