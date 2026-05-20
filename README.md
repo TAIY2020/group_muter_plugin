@@ -42,8 +42,7 @@
 ```toml
 [plugin]
 name = "group_muter_plugin"
-version = "2.2.0"
-config_version = "2.2.0"
+config_version = "2.1.0"
 enabled = true
 
 [mute]
@@ -122,9 +121,9 @@ list = []
 
 ## 🔄 从 v1.x 升级
 
-v2.x 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
+v2.1.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
-| 项目 | v1.x (旧版) | v2.x (新版) |
+| 项目 | v1.x (旧版) | v2.0.0 (新版) |
 | ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
 | 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (入站 + 出站双重拦截) |

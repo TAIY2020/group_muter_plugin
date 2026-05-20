@@ -21,11 +21,33 @@ import asyncio
 import logging
 import re
 import time
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
 
 logger = logging.getLogger(__name__)
+
+def _load_manifest_version() -> str:
+    """从 _manifest.json 读取版本号，保持插件元数据单一来源。"""
+    try:
+        manifest_path = Path(__file__).parent / "_manifest.json"
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        version = data.get("version")
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+        logger.warning(
+            "_manifest.json 中 version 字段缺失或非法 (%r)，回落到 0.0.0", version,
+        )
+    except Exception:
+        logger.warning("读取 _manifest.json 失败，回落到 0.0.0", exc_info=True)
+    return "0.0.0"
+
+
+PLUGIN_VERSION = _load_manifest_version()
+
+CONFIG_SCHEMA_VERSION = "2.1.0"
 
 # 预编译正则：匹配 CQ at 码或 @前缀
 _AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
@@ -43,13 +65,8 @@ class PluginSection(PluginConfigBase):
         description="插件名称",
         json_schema_extra={"disabled": True}
     )
-    version: str = Field(
-        default="2.2.0",
-        description="插件版本",
-        json_schema_extra={"disabled": True}
-    )
     config_version: str = Field(
-        default="2.2.0",
+        default=CONFIG_SCHEMA_VERSION,
         description="配置文件版本",
         json_schema_extra={"disabled": True}
     )
@@ -505,7 +522,7 @@ class GroupMuterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._user_set = {str(u) for u in self.config.user_control.list}
-        logger.info("群聊静音插件(v2.2.0)初始化完成。")
+        logger.info("群聊静音插件(v%s)初始化完成。", PLUGIN_VERSION)
 
     async def on_unload(self) -> None:
         """插件卸载时取消后台任务。
