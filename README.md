@@ -4,7 +4,7 @@
 
 这个插件为群组管理员提供了一个强大的工具来让麦麦“静音”（闭嘴）。当群聊需要专注讨论或减少麦麦干扰时，管理员可以一键“静音”麦麦。在静音模式下，麦麦将忽略所有消息，直到被管理员唤醒或到达静音时间自动解除静音。
 
-> 本版本 (v2.1.0) 基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本 (v2.2.0) 基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -42,7 +42,6 @@
 ```toml
 [plugin]
 name = "group_muter_plugin"
-version = "2.1.0"
 config_version = "2.1.0"
 enabled = true
 
