@@ -21,10 +21,11 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
 
-logger = logging.getLogger("plugin.group_muter")
+logger = logging.getLogger(__name__)
 
 # 预编译正则：匹配 CQ at 码或 @前缀
 _AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
@@ -43,12 +44,12 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"disabled": True}
     )
     version: str = Field(
-        default="2.1.0",
+        default="2.2.0",
         description="插件版本",
         json_schema_extra={"disabled": True}
     )
     config_version: str = Field(
-        default="2.1.0",
+        default="2.2.0",
         description="配置文件版本",
         json_schema_extra={"disabled": True}
     )
@@ -156,75 +157,92 @@ class GroupMuterConfig(PluginConfigBase):
 
 # --- 核心状态管理器 ---
 
-class MuteStatus:
-    """群聊静音状态管理器（类级别单例，跨实例共享状态）。
+class MuteSessionTracker:
+    """群聊静音的多群会话跟踪器（实例字段，禁止做类变量）。
 
-    注意：使用类变量作为共享状态，在插件重载时需要手动清理。
+    每个 GroupMuterPlugin 实例持有一个 tracker 实例。曾经的类变量
+    在 SDK"预热新实例 → 原子切换 → unload 旧实例"热重载时序下
+    会被旧实例的 on_unload clear() 抹掉新实例状态。改成实例字段后自然隔离。
+
+    持有的状态：
+        * 每群剩余静音时长（group_id → expire_at）
+        * 群名缓存（日志友好显示）
+        * 短期发送豁免窗口（插件自身控制消息的"放行令牌"）
+        * 后台摘要任务（周期性输出仍静音群的剩余时间）
+        * 每群消息驱动日志的节流时间戳
+
+    热重载 → 状态丢失是接受的行为，见 docs/adr/0001-mute-tracker-no-persistence.md。
     """
 
-    _mute_until: Dict[str, float] = {}
-    _group_names: Dict[str, str] = {}
-    _send_exempt_until: Dict[str, float] = {}  # group_id → 豁免截止时间戳
-    _summary_task: Optional[asyncio.Task] = None  # 后台摘要日志定时任务
-    _last_msg_log_time: Dict[str, float] = {}  # 消息驱动日志的节流时间戳
+    def __init__(self) -> None:
+        self._mute_until: Dict[str, float] = {}
+        self._group_names: Dict[str, str] = {}
+        self._send_exempt_until: Dict[str, float] = {}  # group_id → 豁免截止时间戳
+        self._summary_task: Optional[asyncio.Task] = None  # 后台摘要日志定时任务
+        self._last_msg_log_time: Dict[str, float] = {}  # 消息驱动日志的节流时间戳
 
-    @classmethod
-    def set_send_exempt(cls, group_id: str, seconds: float = 5.0):
-        """设置短暂的发送豁免期，允许插件自身的控制消息通过。"""
-        cls._send_exempt_until[group_id] = time.time() + seconds
+    def display_name(self, group_id: str) -> str:
+        """返回日志显示用的群名；缺失时回退为 group_id。"""
+        return self._group_names.get(group_id, group_id)
 
-    @classmethod
-    def is_send_exempt(cls, group_id: str) -> bool:
-        """检查指定群是否处于发送豁免期。"""
-        exempt_until = cls._send_exempt_until.get(group_id)
-        if exempt_until and time.time() < exempt_until:
-            return True
-        cls._send_exempt_until.pop(group_id, None)
-        return False
+    def set_send_exempt(self, group_id: str, seconds: float = 1.5) -> None:
+        """记录一个单次性发送豁免令牌。
 
-    @classmethod
-    def set_mute(cls, group_id: str, seconds: int, group_name: Optional[str] = None):
+        令牌被 ``consume_exempt`` 命中后立即消耗；``seconds`` 内一直没人来取
+        则按时间过期被丢弃，避免长期残留。默认 1.5 秒覆盖"set_send_exempt 到
+        紧邻的 send.text 进入 before_send hook"的合理上限。
+        """
+        self._send_exempt_until[group_id] = time.time() + seconds
+
+    def consume_exempt(self, group_id: str) -> bool:
+        """检查并**消耗**豁免令牌：未过期则返 True 同时立即清掉；否则 False。
+
+        单次性的设计避免基于"时间窗口"被其它插件的并发出站消息无意中也享受到豁免——
+        多插件并发场景下严格来说存在"别的插件抢先 consume 让本插件的控制消息反被拦"
+        的理论顺序竞争，但在实际链路中"set_send_exempt → await ctx.send.text"是
+        紧邻同步操作，其它插件极少能比 inline send 更快进入 before_send hook。
+        """
+        exempt_until = self._send_exempt_until.pop(group_id, None)
+        return exempt_until is not None and time.time() < exempt_until
+
+    def set_mute(self, group_id: str, seconds: int, group_name: Optional[str] = None) -> None:
         """开启指定群的静音状态，并启动后台摘要日志任务。"""
-        cls._mute_until[group_id] = time.time() + seconds
+        self._mute_until[group_id] = time.time() + seconds
         if group_name:
-            cls._group_names[group_id] = group_name
+            self._group_names[group_id] = group_name
         logger.info(f"[{group_name or group_id}] 进入静音模式，持续 {seconds} 秒。")
         # 确保后台摘要日志任务正在运行
-        cls._ensure_summary_task()
+        self._ensure_summary_task()
 
-    @classmethod
-    def clear_mute(cls, group_id: str):
+    def clear_mute(self, group_id: str) -> None:
         """解除指定群的静音状态。"""
-        if cls._mute_until.pop(group_id, None):
-            group_name = cls._group_names.pop(group_id, None)
+        if self._mute_until.pop(group_id, None):
+            group_name = self._group_names.pop(group_id, None)
+            self._last_msg_log_time.pop(group_id, None)
             logger.info(f"[{group_name or group_id}] 已解除静音模式。")
 
-    @classmethod
-    def is_muted(cls, group_id: str) -> bool:
+    def is_muted(self, group_id: str) -> bool:
         """检查指定群是否处于静音状态，超时则自动解除。"""
-        mute_end_time = cls._mute_until.get(group_id)
+        mute_end_time = self._mute_until.get(group_id)
         if mute_end_time and time.time() >= mute_end_time:
-            logger.info(f"[{cls._group_names.get(group_id, group_id)}] 静音时间已到，自动解除。")
-            cls.clear_mute(group_id)
+            logger.info(f"[{self.display_name(group_id)}] 静音时间已到，自动解除。")
+            self.clear_mute(group_id)
             return False
         return bool(mute_end_time)
 
-    @classmethod
-    def remaining_seconds(cls, group_id: str) -> int:
+    def remaining_seconds(self, group_id: str) -> int:
         """返回指定群的剩余静音秒数。"""
-        mute_end_time = cls._mute_until.get(group_id)
+        mute_end_time = self._mute_until.get(group_id)
         if mute_end_time:
             return max(int(mute_end_time - time.time()), 0)
         return 0
 
-    @classmethod
-    def _ensure_summary_task(cls):
+    def _ensure_summary_task(self) -> None:
         """确保后台摘要日志任务正在运行。如果已停止或未启动，则创建新任务。"""
-        if cls._summary_task is None or cls._summary_task.done():
-            cls._summary_task = asyncio.create_task(cls._summary_loop())
+        if self._summary_task is None or self._summary_task.done():
+            self._summary_task = asyncio.create_task(self._summary_loop())
 
-    @classmethod
-    async def _summary_loop(cls):
+    async def _summary_loop(self) -> None:
         """后台定时任务：每 30 秒打印一次所有静音群的状态摘要。
 
         当没有任何群处于静音状态时，任务自动退出。
@@ -236,7 +254,7 @@ class MuteStatus:
                 # 收集仍在静音中的群
                 active_groups = []
                 expired_groups = []
-                for group_id, mute_end_time in list(cls._mute_until.items()):
+                for group_id, mute_end_time in list(self._mute_until.items()):
                     if now >= mute_end_time:
                         expired_groups.append(group_id)
                     else:
@@ -244,53 +262,63 @@ class MuteStatus:
 
                 # 清理已过期的静音
                 for group_id in expired_groups:
-                    display_name = cls._group_names.get(group_id, group_id)
+                    display_name = self.display_name(group_id)
                     logger.info(f"[{display_name}] 静音时间已到，自动解除。")
-                    cls._mute_until.pop(group_id, None)
-                    cls._group_names.pop(group_id, None)
+                    self._mute_until.pop(group_id, None)
+                    self._group_names.pop(group_id, None)
+                    self._last_msg_log_time.pop(group_id, None)
 
                 # 打印仍在静音中的群的摘要
                 for group_id in active_groups:
-                    mute_end_time = cls._mute_until.get(group_id)
+                    mute_end_time = self._mute_until.get(group_id)
                     if mute_end_time:
                         remaining = int(mute_end_time - now)
                         end_str = time.strftime("%H:%M:%S", time.localtime(mute_end_time))
-                        display_name = cls._group_names.get(group_id, group_id)
+                        display_name = self.display_name(group_id)
                         logger.info(
                             f"[{display_name}] 处于静音模式，剩余 {remaining} 秒，"
                             f"将在 {end_str} 结束。"
                         )
 
                 # 没有任何群在静音中，退出循环
-                if not cls._mute_until:
+                if not self._mute_until:
                     logger.debug("所有群已解除静音，摘要日志任务退出。")
                     break
         except asyncio.CancelledError:
             pass
 
-    @classmethod
-    def cancel_summary_task(cls):
-        """取消后台摘要日志任务。"""
-        if cls._summary_task and not cls._summary_task.done():
-            cls._summary_task.cancel()
-            cls._summary_task = None
+    async def cancel_summary_task(self) -> None:
+        """取消并等待后台摘要日志任务真正退出。
 
-    @classmethod
-    def log_on_message(cls, group_id: str):
+        必须在 on_unload 调用：_summary_loop 的 bound method 持 self 强引用，
+        不取消会让旧实例无法被 GC。
+
+        async + await：cancel() 仅设置取消标志后立即返回，task 实际仍在事件循环中
+        排队执行 CancelledError。若 on_unload 同步返回 → Runner 立即清理插件实例 →
+        task 仍可能调用已被释放的 self.* 字段。必须 await 让 CancelledError 真正
+        传播完成后再退出。
+        """
+        task = self._summary_task
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._summary_task = None
+
+    def log_on_message(self, group_id: str) -> None:
         """收到被拦截的消息时打印一次剩余时间（每 30 秒最多一次）。"""
         now = time.time()
-        if now - cls._last_msg_log_time.get(group_id, 0) < 30:
+        if now - self._last_msg_log_time.get(group_id, 0) < 30:
             return
-        mute_end_time = cls._mute_until.get(group_id)
+        mute_end_time = self._mute_until.get(group_id)
         if mute_end_time:
             remaining = int(mute_end_time - now)
             end_str = time.strftime("%H:%M:%S", time.localtime(mute_end_time))
-            display_name = cls._group_names.get(group_id, group_id)
+            display_name = self.display_name(group_id)
             logger.info(
                 f"[{display_name}] 静音中拦截消息，剩余 {remaining} 秒，"
                 f"将在 {end_str} 结束。"
             )
-            cls._last_msg_log_time[group_id] = now
+            self._last_msg_log_time[group_id] = now
 
 
 # --- 辅助函数 ---
@@ -307,48 +335,31 @@ def _is_keyword_in_text(text: str, keywords: List[str]) -> bool:
     return _strip_at_prefix(text) in keywords
 
 
-def _is_bot_mentioned(message: dict, plain_text: str, raw_content: str,
-                      message_segments: list) -> bool:
-    """检测消息中是否 @了麦麦。
+def _is_bot_mentioned(message: dict) -> bool:
+    """检测消息中是否 @ 了麦麦。
 
-    检测策略（按优先级）：
-    1. message 中的 is_at 字段（SDK 预处理标记，最可靠）
-    2. message 中的 is_mentioned 字段（SDK 预处理标记）
-    3. message_segments 中是否有 type="at" 的段
-    4. raw_content 中是否包含 [CQ:at,...] 码
+    依赖 adapter 在入站时正确设置 ``is_at`` / ``is_mentioned``，语义为"@ 到 bot 自己"。
+    napcat adapter 已实现该契约（仅当 target_user_id == self_id 时设 True）；
+    其它 adapter 若未实现，本插件的 @ 解除静音功能会降级——但关键词解除仍可用。
+
+    历史上还有"扫描 message_segments 含 at 段"和"raw_content 含 [CQ:at,]"两条
+    fallback 策略，但它们把"@任何人"误判为"@ bot"。详情见
+    docs/adr/0002-trust-adapter-is-at-fields.md。
     """
-    # 策略1+2：SDK 预处理标记（最可靠，不依赖名字或格式）
-    if message.get("is_at"):
-        return True
-    if message.get("is_mentioned"):
-        return True
-
-    # 策略3：检查消息段中的 at 类型
-    if message_segments:
-        for seg in message_segments:
-            if isinstance(seg, dict) and (seg.get("type") or "") == "at":
-                return True
-
-    # 策略4：检查原始内容中的 CQ:at 码
-    if raw_content and "[CQ:at," in raw_content:
-        return True
-
-    return False
+    return bool(message.get("is_at") or message.get("is_mentioned"))
 
 
 def _extract_from_message(message: Optional[dict]) -> tuple:
     """从序列化的 SessionMessage 字典中提取关键字段。
 
     Returns:
-        (plain_text, raw_content, stream_id, group_id, group_name, user_id, message_segments)
+        (plain_text, stream_id, group_id, group_name, user_id)
     """
     if not message or not isinstance(message, dict):
-        return "", "", "", "", "", "", []
+        return "", "", "", "", ""
 
     # processed_plain_text 用于关键词匹配（已去除 CQ 码）
     plain_text = message.get("processed_plain_text") or message.get("plain_text") or ""
-    # 原始内容保留 CQ 码，用于 @ 检测
-    raw_content = message.get("raw_content") or message.get("plain_text") or ""
     stream_id = message.get("session_id") or ""
 
     msg_info = message.get("message_info") or {}
@@ -359,13 +370,119 @@ def _extract_from_message(message: Optional[dict]) -> tuple:
     group_id = group_info.get("group_id") or ""
     group_name = group_info.get("group_name") or ""
 
-    # 提取消息段列表，用于精确检测 at 类型
-    message_segments = msg_info.get("message_segments") or message.get("message_segments") or []
-
     return (
-        str(plain_text), str(raw_content), str(stream_id),
-        str(group_id), str(group_name), str(user_id), message_segments,
+        str(plain_text), str(stream_id),
+        str(group_id), str(group_name), str(user_id),
     )
+
+
+# --- 主插件类 ---
+
+# --- 决策树解析 ---
+
+
+@dataclass(frozen=True)
+class MuteIntent:
+    """决策树解析后的离散意图。dispatch 据此 1:1 派发副作用。
+
+    并非所有字段对所有 kind 都有意义——例如 ``pass_through`` 不需要 group_id。
+    保持单 dataclass + kind 字段的写法是为了构造与派发都简洁；若未来意图维度
+    变多再切换到 sum type。
+    """
+
+    kind: Literal[
+        "pass_through",
+        "start_mute",
+        "refuse_start",
+        "end_mute",
+        "intercept_while_muted",
+    ]
+    group_id: str = ""
+    group_name: str = ""
+    stream_id: str = ""
+
+
+class MuteIntentResolver:
+    """纯函数式：(message, mute_status, config, user_set) → MuteIntent。
+
+    不修改任何状态（仅读 mute_status；is_muted 自带的过期清理是幂等的），
+    不调任何 ``ctx.*`` RPC。所有副作用（开/解除静音、发消息、日志）由
+    ``GroupMuterPlugin._dispatch_intent`` 执行。
+
+    这样决策树可独立单测（喂 dict + state + config，断言 intent）；
+    新增规则只在 ``resolve`` 里加一条 if 返回新 kind，副作用在 dispatch 加一个 elif
+    即可——主路径（handler）不必再碰。
+    """
+
+    @staticmethod
+    def resolve(
+        *,
+        message: dict,
+        mute_status: "MuteSessionTracker",
+        mute_config: "MuteSection",
+        user_control: "UserControlSection",
+        user_set: set[str],
+    ) -> MuteIntent:
+        plain_text, stream_id, group_id, group_name, user_id = (
+            _extract_from_message(message)
+        )
+
+        # 非群聊 → 透传
+        if not group_id:
+            return MuteIntent(kind="pass_through")
+
+        is_admin = MuteIntentResolver._is_admin(user_id, user_control, user_set)
+        muted = mute_status.is_muted(group_id)
+
+        # --- 未静音 ---
+        if not muted:
+            if _is_keyword_in_text(plain_text, mute_config.mute_keywords):
+                if is_admin:
+                    return MuteIntent(
+                        kind="start_mute",
+                        group_id=group_id,
+                        group_name=group_name,
+                        stream_id=stream_id,
+                    )
+                return MuteIntent(
+                    kind="refuse_start",
+                    group_id=group_id,
+                    stream_id=stream_id,
+                )
+            return MuteIntent(kind="pass_through")
+
+        # --- 已静音 ---
+        if is_admin and mute_config.at_mention_break and _is_bot_mentioned(message):
+            return MuteIntent(
+                kind="end_mute",
+                group_id=group_id,
+                stream_id=stream_id,
+            )
+        if (
+            is_admin
+            and mute_config.enable_unmute
+            and _is_keyword_in_text(plain_text, mute_config.unmute_keywords)
+        ):
+            return MuteIntent(
+                kind="end_mute",
+                group_id=group_id,
+                stream_id=stream_id,
+            )
+
+        return MuteIntent(kind="intercept_while_muted", group_id=group_id)
+
+    @staticmethod
+    def _is_admin(
+        user_id: str, user_control: "UserControlSection", user_set: set[str],
+    ) -> bool:
+        if not user_id:
+            return False
+        uid = str(user_id)
+        if user_control.list_type == "whitelist":
+            return uid in user_set
+        if user_control.list_type == "blacklist":
+            return uid not in user_set
+        return False  # 不可达：field_validator 已把非法 list_type 归一化
 
 
 # --- 主插件类 ---
@@ -383,36 +500,27 @@ class GroupMuterPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._user_set: set[str] = set()  # 缓存权限用户集合
+        # 实例字段而非类变量：避免热重载时旧实例 on_unload 抹掉新实例状态
+        self._mute_status = MuteSessionTracker()
 
     async def on_load(self) -> None:
         self._user_set = {str(u) for u in self.config.user_control.list}
-        logger.info("群聊静音插件(v2.1.0)初始化完成。")
+        logger.info("群聊静音插件(v2.2.0)初始化完成。")
 
     async def on_unload(self) -> None:
-        """插件卸载时清理所有静音状态和后台任务。"""
-        MuteStatus.cancel_summary_task()
-        MuteStatus._mute_until.clear()
-        MuteStatus._group_names.clear()
-        MuteStatus._send_exempt_until.clear()
-        MuteStatus._last_msg_log_time.clear()
+        """插件卸载时取消后台任务。
+
+        实例字段随插件 GC 自动回收，无需手动 clear；但 cancel_summary_task()
+        必须 await——_summary_loop 的 bound method 持 self 强引用，
+        不取消会让旧实例无法被 GC；cancel() 是异步信号，必须 await 等 task
+        真正退出，否则 Runner 释放实例后 task 仍可能触达已失效字段。
+        """
+        await self._mute_status.cancel_summary_task()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         """配置热重载回调。"""
         if scope == "self":
             self._user_set = {str(u) for u in self.config.user_control.list}
-
-    def _check_permission(self, user_id: str) -> bool:
-        """检查用户是否有操作权限。"""
-        if not user_id:
-            return False
-        user_id_str = str(user_id)
-        list_type = self.config.user_control.list_type
-        if list_type == "whitelist":
-            return user_id_str in self._user_set
-        if list_type == "blacklist":
-            return user_id_str not in self._user_set
-        logger.warning(f"未知的权限列表类型: '{list_type}'，默认拒绝")
-        return False
 
     # ===== 核心 Hook 处理器 =====
 
@@ -442,11 +550,11 @@ class GroupMuterPlugin(MaiBotPlugin):
         if not group_id:
             return None
 
-        if MuteStatus.is_muted(group_id):
-            # 检查是否在豁免期（插件自身发送的控制消息）
-            if MuteStatus.is_send_exempt(group_id):
+        if self._mute_status.is_muted(group_id):
+            # 检查并消耗豁免令牌：单次性，避免 N 秒窗口期内别的插件也搭便车
+            if self._mute_status.consume_exempt(group_id):
                 return None
-            display_name = MuteStatus._group_names.get(group_id, group_id)
+            display_name = self._mute_status.display_name(group_id)
             logger.info(f"[{display_name}] 静音中，拦截出站消息")
             return {"action": "abort"}
 
@@ -464,84 +572,56 @@ class GroupMuterPlugin(MaiBotPlugin):
     async def handle_mute_guard(self, message: Optional[dict] = None, **kwargs):
         """群聊静音核心处理器。
 
-        在 chat.receive.after_process 阶段拦截：
-        1. 非群聊 → continue
-        2. 群未静音 + 管理员 + 静音关键词 → 开启静音，abort
-        3. 群未静音 + 非管理员 + 静音关键词 → 拒绝提示，abort
-        4. 群未静音 + 普通消息 → continue
-        5. 群已静音 + 管理员 + @麦麦 → 解除静音，abort
-        6. 群已静音 + 管理员 + 解除关键词 → 解除静音，abort
-        7. 群已静音 + 其他消息 → 拦截，abort
+        薄入口：把决策完全委托给 MuteIntentResolver（纯解析），handler 自己只做
+        intent → 副作用的 1:1 派发。新增静音规则的扩展点在 resolver 而非这里。
         """
-        if message is None:
+        if message is None or not isinstance(message, dict):
             return None
 
-        # 调试日志：打印 message 完整结构，用于排查字段名
-        logger.debug("[mute_guard] message keys: %s", list(message.keys()) if isinstance(message, dict) else type(message))
-        if isinstance(message, dict):
-            msg_info = message.get("message_info") or {}
-            logger.debug(
-                "[mute_guard] message_info keys: %s | "
-                "raw_content=%r | processed_plain_text=%r | plain_text=%r | "
-                "message_segments=%r",
-                list(msg_info.keys()) if isinstance(msg_info, dict) else type(msg_info),
-                message.get("raw_content"),
-                message.get("processed_plain_text"),
-                message.get("plain_text"),
-                (msg_info.get("message_segments") if isinstance(msg_info, dict) else None),
-            )
-
-        plain_text, raw_content, stream_id, group_id, group_name, user_id, message_segments = _extract_from_message(message)
-
-        # 仅处理群消息
-        if not group_id:
-            return None
-
-        is_admin = self._check_permission(user_id)
-        mute_keywords = self.config.mute.mute_keywords
-
-        # --- 群未静音 ---
-        if not MuteStatus.is_muted(group_id):
-            if _is_keyword_in_text(plain_text, mute_keywords):
-                if is_admin:
-                    duration = self.config.mute.duration_seconds
-                    MuteStatus.set_mute(group_id, duration, group_name or None)
-                    MuteStatus.set_send_exempt(group_id, 5.0)
-                    await self.ctx.send.text(self.config.mute.mute_reply, stream_id)
-                    return {"action": "abort"}
-                else:
-                    await self.ctx.send.text(self.config.mute.no_permission_reply, stream_id)
-                    return {"action": "abort"}
-            # 普通消息，放行
-            return None
-
-        # --- 群已静音 ---
-
-        # 管理员 @麦麦 → 自动解除
-        bot_mentioned = _is_bot_mentioned(message, plain_text, raw_content, message_segments)
-        logger.debug(
-            "[mute_guard] @检测: is_admin=%s, at_mention_break=%s, bot_mentioned=%s | "
-            "is_at=%r, is_mentioned=%r, plain_text=%r, raw_content=%r, segments=%r",
-            is_admin, self.config.mute.at_mention_break, bot_mentioned,
-            message.get("is_at"), message.get("is_mentioned"),
-            plain_text[:200], raw_content[:200], message_segments,
+        intent = MuteIntentResolver.resolve(
+            message=message,
+            mute_status=self._mute_status,
+            mute_config=self.config.mute,
+            user_control=self.config.user_control,
+            user_set=self._user_set,
         )
-        if is_admin and self.config.mute.at_mention_break and bot_mentioned:
-            MuteStatus.set_send_exempt(group_id, 5.0)
-            MuteStatus.clear_mute(group_id)
-            await self.ctx.send.text(self.config.mute.unmute_reply, stream_id)
+        return await self._dispatch_intent(intent)
+
+    async def _dispatch_intent(self, intent: MuteIntent) -> Optional[Dict[str, Any]]:
+        """根据 intent 执行副作用（修改 mute 状态 + 发回复 + 日志）。"""
+        if intent.kind == "pass_through":
+            return None
+
+        logger.debug(
+            "[mute_guard] intent=%s group=%s", intent.kind, intent.group_id or "<n/a>",
+        )
+
+        if intent.kind == "start_mute":
+            duration = self.config.mute.duration_seconds
+            self._mute_status.set_mute(
+                intent.group_id, duration, intent.group_name or None,
+            )
+            self._mute_status.set_send_exempt(intent.group_id)
+            await self.ctx.send.text(self.config.mute.mute_reply, intent.stream_id)
             return {"action": "abort"}
 
-        # 管理员 + 解除关键词 → 解除
-        if is_admin and self.config.mute.enable_unmute and _is_keyword_in_text(plain_text, self.config.mute.unmute_keywords):
-            MuteStatus.set_send_exempt(group_id, 5.0)
-            MuteStatus.clear_mute(group_id)
-            await self.ctx.send.text(self.config.mute.unmute_reply, stream_id)
+        if intent.kind == "refuse_start":
+            await self.ctx.send.text(
+                self.config.mute.no_permission_reply, intent.stream_id,
+            )
             return {"action": "abort"}
 
-        # 其他所有消息一律拦截，打印剩余时间
-        MuteStatus.log_on_message(group_id)
-        return {"action": "abort"}
+        if intent.kind == "end_mute":
+            self._mute_status.set_send_exempt(intent.group_id)
+            self._mute_status.clear_mute(intent.group_id)
+            await self.ctx.send.text(self.config.mute.unmute_reply, intent.stream_id)
+            return {"action": "abort"}
+
+        if intent.kind == "intercept_while_muted":
+            self._mute_status.log_on_message(intent.group_id)
+            return {"action": "abort"}
+
+        return None
 
 
 def create_plugin() -> GroupMuterPlugin:
