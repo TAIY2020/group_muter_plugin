@@ -629,7 +629,6 @@ class GroupMuterPlugin(MaiBotPlugin):
             return {"action": "abort"}
 
         if intent.kind == "end_mute":
-            self._mute_status.set_send_exempt(intent.group_id)
             self._mute_status.clear_mute(intent.group_id)
             await self.ctx.send.text(self.config.mute.unmute_reply, intent.stream_id)
             return {"action": "abort"}
