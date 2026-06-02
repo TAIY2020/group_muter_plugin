@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "2.2.3",
+  "version": "2.2.4",
   "name": "群聊静音插件 | GroupMuter Plugin",
   "description": "一个允许管理员通过聊天命令，让麦麦在指定群聊中临时进入“静音状态”（闭嘴）的群组管理插件。",
   "author": {
@@ -38,7 +38,7 @@
   "display": {
     "icon": {
       "type": "local",
-      "value": "./mute.webp"
+      "value": "./icon.webp"
     }
   },
   "id": "TAIY2020.group-muter-plugin"

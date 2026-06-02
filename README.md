@@ -4,7 +4,7 @@
 
 这个插件为群组管理员提供了一个强大的工具来让麦麦“静音”（闭嘴）。当群聊需要专注讨论或减少麦麦干扰时，管理员可以一键“静音”麦麦。在静音模式下，麦麦将忽略所有消息，直到被管理员唤醒或到达静音时间自动解除静音。
 
-> 本版本 (v2.2.0) 基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -121,9 +121,9 @@ list = []
 
 ## 🔄 从 v1.x 升级
 
-v2.1.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
+v2.x 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
-| 项目 | v1.x (旧版) | v2.0.0 (新版) |
+| 项目 | v1.x (旧版) | v2.x (新版) |
 | ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
 | 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (入站 + 出站双重拦截) |
