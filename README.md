@@ -37,6 +37,30 @@
 
 首次启动麦麦后，插件会在其目录下自动生成 `config.toml` 文件。配置管理员权限后重启麦麦主程序即可。你也可以通过 **Web UI** 在线修改配置，修改后会自动热重载生效。
 
+**默认配置示例**:
+
+```toml
+[plugin]
+name = "group_muter_plugin"
+config_version = "2.2.0"
+enabled = true
+
+[mute]
+duration_seconds = 1200
+mute_keywords = ["Mute True", "安安你去看书去"]
+unmute_keywords = ["Mute False", "安安别看了"]
+enable_unmute = true
+at_mention_break = true
+mute_reply = "好吧，那我去看会书📘，你们先聊..."
+renew_reply = "好哦，那我再多看一会书📘"
+unmute_reply = "我回来啦，你们聊啥呢🤔"
+no_permission_reply = "？？？你在教我做事🤡"
+
+[user_control]
+list_type = "whitelist"
+list = []
+```
+
 **⚠️ 重要安全提示**:
 
 - **`user_control.list`**: 这是一个**核心安全设置**。
@@ -78,6 +102,7 @@
 管理员在群里 `@` 麦麦，即可立即解除静音。
 
 - **麦麦回复**: 同样使用 `mute.unmute_reply`
+- **注意**: 消息中同时含关键词时按关键词处理——例如 `@麦麦 Mute True` 是续期而非解除，只有"@ 了麦麦且不含任何关键词"才走 @ 解除。
 
 #### 方式三：自动超时解除
 
@@ -86,13 +111,14 @@
 ### ⚠️ 注意事项
 
 - **静音期间的群消息不会写入聊天历史**。本插件的拦截发生在消息入库之前，因此解除静音后，麦麦对静音期间的群聊内容是"失忆"的（没有这段上下文），触发静音的指令消息本身也不留痕。这是入站拦截方案的已接受权衡，不是 bug。
+- **静音拦截的是该群的所有出站消息**。出站守卫工作在 `send_service.before_send`，静音期间凡经发送服务发往该群的消息都会被拦下——包括同环境其他插件主动发送的消息，不只是麦麦对群聊的回复。
 - 静音状态仅保存在内存中，插件热重载或主程序重启后所有静音会自动解除，管理员重新发送关键词即可。
 
 ### 配置项说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | ------ | ---- | ------ | ---- |
-| `mute.duration_seconds` | int | `1200` | 静音持续时间（秒），范围 60 ~ 86400 |
+| `mute.duration_seconds` | int | `1200` | 静音持续时间（秒），范围 60 ~ 86400，越界值自动收敛到边界 |
 | `mute.mute_keywords` | list | `["Mute True", "安安你去看书去"]` | 触发静音的关键词列表 |
 | `mute.unmute_keywords` | list | `["Mute False", "安安别看了"]` | 解除静音的关键词列表 |
 | `mute.enable_unmute` | bool | `true` | 是否启用关键词解除功能 |

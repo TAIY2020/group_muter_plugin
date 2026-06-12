@@ -47,7 +47,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "2.1.1"
+CONFIG_SCHEMA_VERSION = "2.1.2"
 
 # 预编译正则：匹配 CQ at 码或 @前缀
 _AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
@@ -56,6 +56,10 @@ _CQ_AT_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]")
 
 # 非管理员触发静音关键词时，拒绝回复的同群冷却（秒），防刷屏
 _REFUSE_REPLY_COOLDOWN_SECONDS = 30.0
+
+# 静音时长的合法区间（秒）：Field 校验、WebUI slider、clamp 兜底共用同一边界
+_MUTE_DURATION_MIN_SECONDS = 60
+_MUTE_DURATION_MAX_SECONDS = 86400
 
 
 # --- 配置模型 ---
@@ -90,14 +94,14 @@ class MuteSection(PluginConfigBase):
     duration_seconds: int = Field(
         default=1200,
         description="静音持续时间（秒）",
-        ge=60,
-        le=86400,
+        ge=_MUTE_DURATION_MIN_SECONDS,
+        le=_MUTE_DURATION_MAX_SECONDS,
         json_schema_extra={
             "label": "静音时长（秒）",
             "hint": "60 ~ 86400 秒",
             "x-widget": "slider",
-            "min": 60,
-            "max": 86400,
+            "min": _MUTE_DURATION_MIN_SECONDS,
+            "max": _MUTE_DURATION_MAX_SECONDS,
             "step": 60,
         },
     )
@@ -141,6 +145,45 @@ class MuteSection(PluginConfigBase):
         description="非管理员尝试触发静音时麦麦的拒绝回复语",
         json_schema_extra={"label": "拒绝权限回复语"},
     )
+
+    @field_validator("mute_keywords", "unmute_keywords", mode="before")
+    @classmethod
+    def _drop_blank_keywords(cls, value: Any) -> Any:
+        """剔除空白关键词项。
+
+        纯 @ 消息经 ``_strip_at_prefix`` 剥掉 CQ 码 / @前缀后是空串，
+        关键词列表里混入 ""（WebUI 列表控件误加空项）会让任何纯 @ 消息
+        精确匹配命中——管理员纯 @bot 直接开静音、非管理员被吞消息。
+        """
+        if isinstance(value, list):
+            cleaned = (str(item).strip() for item in value)
+            return [item for item in cleaned if item]
+        return value
+
+    @field_validator("duration_seconds", mode="before")
+    @classmethod
+    def _clamp_duration(cls, value: Any) -> Any:
+        """把越界时长收敛到合法区间，而非让整份配置校验失败。
+
+        SDK 在配置校验失败时只置 ``_plugin_config_instance = None`` 并打
+        一行 warning，之后每次访问 ``self.config`` 都抛 RuntimeError，被
+        两个 hook 的 ErrorPolicy.SKIP 吞掉——手改 toml 写 30 的代价是整个
+        插件静默失效。与 user_control.list 的 ``_coerce_user_ids`` 同一
+        容错哲学。非数值输入原样透传，交给 pydantic 正常报错。
+        """
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return value
+        clamped = min(
+            max(number, _MUTE_DURATION_MIN_SECONDS), _MUTE_DURATION_MAX_SECONDS
+        )
+        if clamped != number:
+            logger.warning(
+                "duration_seconds=%s 超出 [%s, %s]，已收敛为 %s",
+                number, _MUTE_DURATION_MIN_SECONDS, _MUTE_DURATION_MAX_SECONDS, clamped,
+            )
+        return clamped
 
 
 class UserControlSection(PluginConfigBase):
@@ -208,8 +251,8 @@ class MuteSessionTracker:
         * 每群剩余静音时长（group_id → expire_at）
         * 群名缓存（日志友好显示）
         * 每群 stream_id（出站消息缺 group_info 时按 session_id 回退识别）
-        * 单次性发送豁免令牌（group_id → (截止时间, 预期文本)，
-          绑定文本防 bot 在途回复抢消费）
+        * 单次性发送豁免令牌（group_id → {预期文本: 截止时间}，
+          绑定文本防 bot 在途回复抢消费；多键共存防续期顶掉在途令牌）
         * 后台摘要任务（周期性输出仍静音群的剩余时间）
         * 每群消息驱动日志的节流时间戳
 
@@ -220,7 +263,7 @@ class MuteSessionTracker:
         self._mute_until: Dict[str, float] = {}
         self._group_names: Dict[str, str] = {}
         self._stream_ids: Dict[str, str] = {}  # group_id → stream_id（出站守卫的回退匹配键）
-        self._send_exempt: Dict[str, tuple] = {}  # group_id → (豁免截止时间戳, 预期文本)
+        self._send_exempt: Dict[str, Dict[str, float]] = {}  # group_id → {预期文本: 豁免截止时间戳}
         self._summary_task: Optional[asyncio.Task] = None  # 后台摘要日志定时任务
         self._last_msg_log_time: Dict[str, float] = {}  # 消息驱动日志的节流时间戳
 
@@ -231,11 +274,14 @@ class MuteSessionTracker:
     def set_send_exempt(self, group_id: str, expected_text: str, seconds: float = 10.0) -> None:
         """记录一个单次性发送豁免令牌，绑定**预期文本**。
 
-        令牌按"群 + 预期文本"存：``consume_exempt`` 只有在出站文本与
-        ``expected_text`` 匹配时才消耗并放行。仅按群存的旧设计有一个高概率
+        令牌按"群 + 预期文本"多键共存：``consume_exempt`` 只有在出站文本与
+        某个预期文本匹配时才消耗该键并放行。仅按群存的旧设计有一个高概率
         竞争——管理员发静音指令时，bot 往往正有一条已进入思考流程的在途回复
         （bot 话多才需要静音），它若先到 before_send 就会抢走令牌被放行，
         而控制消息反被自己的守卫拦下。绑定文本后在途回复抢不走令牌。
+        多键共存解决另一个窄窗口：start 的控制消息还在途时管理员立刻续期，
+        renew 的令牌不再顶掉 mute_reply 的令牌。同一文本重复入队只刷新
+        过期时间（仍只放行一条）——比误拦好，且窗口极窄。
 
         ``seconds`` 内一直没人来取则按时间过期被丢弃。默认 10 秒：
         从 set_send_exempt 到本插件的 before_send 守卫被调度，中间隔着
@@ -247,26 +293,27 @@ class MuteSessionTracker:
         已知边界：排在本插件前面的 hook 若改写了消息文本，比对会失配 →
         控制消息被拦（fail-closed，与无令牌时的失败模式相同），令牌留到过期。
         """
-        self._send_exempt[group_id] = (time.time() + seconds, expected_text.strip())
+        tokens = self._send_exempt.setdefault(group_id, {})
+        tokens[expected_text.strip()] = time.time() + seconds
 
     def consume_exempt(self, group_id: str, outbound_text: str) -> bool:
         """检查并**消耗**豁免令牌。
 
-        未过期且 ``outbound_text`` 与预期文本匹配 → 返 True 并立即清掉；
-        文本不匹配（如 bot 自己的在途回复）→ 返 False 且**保留令牌**，
-        等真正的控制消息来取；已过期 → 清掉并返 False。
+        先剔除该群所有已过期的令牌；``outbound_text`` 与某个未过期的预期
+        文本匹配 → 消耗该键并返 True；不匹配（如 bot 自己的在途回复）→
+        返 False 且**保留其余令牌**，等真正的控制消息来取。
         """
-        entry = self._send_exempt.get(group_id)
-        if entry is None:
+        tokens = self._send_exempt.get(group_id)
+        if not tokens:
             return False
-        expire_at, expected_text = entry
-        if time.time() >= expire_at:
+        now = time.time()
+        for text in [t for t, expire_at in tokens.items() if now >= expire_at]:
+            tokens.pop(text, None)
+        key = (outbound_text or "").strip()
+        matched = tokens.pop(key, None) is not None
+        if not tokens:
             self._send_exempt.pop(group_id, None)
-            return False
-        if (outbound_text or "").strip() != expected_text:
-            return False
-        self._send_exempt.pop(group_id, None)
-        return True
+        return matched
 
     def set_mute(
         self,
@@ -300,6 +347,7 @@ class MuteSessionTracker:
         if self._mute_until.pop(group_id, None) is not None:
             group_name = self._group_names.pop(group_id, None)
             self._stream_ids.pop(group_id, None)
+            self._send_exempt.pop(group_id, None)
             self._last_msg_log_time.pop(group_id, None)
             display_name = group_name or group_id
             if expired:
@@ -381,6 +429,10 @@ class MuteSessionTracker:
                     break
         except asyncio.CancelledError:
             pass
+        except Exception:
+            # 任务死亡不影响核心功能（is_muted 惰性过期兜底），但不记日志
+            # 异常会埋到 GC 时才以 "exception was never retrieved" 浮出
+            logger.exception("摘要日志任务异常退出，下次 set_mute 时自动重建")
 
     async def cancel_summary_task(self) -> None:
         """取消并等待后台摘要日志任务真正退出。
@@ -426,7 +478,9 @@ def _strip_at_prefix(text: str) -> str:
 def _is_keyword_in_text(text: str, keywords: List[str]) -> bool:
     """检查文本（去除 CQ 码 / @前缀后）是否匹配关键词列表中的某个词。
 
-    主路径是剥掉 ``[CQ:at,...]`` 与 ``@\\S+`` 后精确匹配。但 at 段在
+    主路径是剥掉 ``[CQ:at,...]`` 与 ``@\\S+`` 后精确匹配；剥后为空串
+    （纯 @ 消息）不参与匹配——配置层 ``_drop_blank_keywords`` 已剔除空
+    关键词，这里是对称防御。但 at 段在
     processed_plain_text 中渲染为 "@群名片"，QQ 群名片可含空格，
     ``@\\S+`` 剥不干净（如 "@张 三 Mute True" 剥后残留 "三 Mute True"）。
     兜底：剥掉 CQ 码后若以 "@" 开头，允许"以关键词结尾"的后缀匹配——
@@ -434,7 +488,8 @@ def _is_keyword_in_text(text: str, keywords: List[str]) -> bool:
     """
     if not text or not keywords:
         return False
-    if _strip_at_prefix(text) in keywords:
+    stripped = _strip_at_prefix(text)
+    if stripped and stripped in keywords:
         return True
     no_cq = _CQ_AT_PATTERN.sub("", text).strip()
     if no_cq.startswith("@"):
@@ -470,8 +525,9 @@ class MessageContext:
         if not message or not isinstance(message, dict):
             return cls()
 
-        # processed_plain_text 用于关键词匹配（已去除 CQ 码）
-        plain_text = message.get("processed_plain_text") or message.get("plain_text") or ""
+        # processed_plain_text 用于关键词匹配（已去除 CQ 码）；
+        # Host 序列化层只输出 processed_plain_text 这一个纯文本键
+        plain_text = message.get("processed_plain_text") or ""
 
         msg_info = message.get("message_info") or {}
         user_info = msg_info.get("user_info") or {}
@@ -586,12 +642,11 @@ class MuteIntentResolver:
             return MuteIntent(kind="pass_through")
 
         # --- 已静音 ---
-        if is_admin and mute_config.at_mention_break and context.is_bot_mentioned:
-            return MuteIntent(
-                kind="end_mute",
-                group_id=context.group_id,
-                stream_id=context.stream_id,
-            )
+        # 判定顺序敏感：解除关键词 → 静音关键词（续期）→ 纯 @ 解除。
+        # @ 检查必须放在关键词之后——管理员习惯用 "@bot Mute True" 发指令，
+        # 若 @ 解除先判，这条消息在未静音时是 start_mute、已静音时却变成
+        # end_mute，同一条消息两种状态下语义相反。只有"@ 了 bot 且不含
+        # 任何关键词"才走 @ 解除。
         if (
             is_admin
             and mute_config.enable_unmute
@@ -608,6 +663,12 @@ class MuteIntentResolver:
                 kind="renew_mute",
                 group_id=context.group_id,
                 group_name=context.group_name,
+                stream_id=context.stream_id,
+            )
+        if is_admin and mute_config.at_mention_break and context.is_bot_mentioned:
+            return MuteIntent(
+                kind="end_mute",
+                group_id=context.group_id,
                 stream_id=context.stream_id,
             )
 
@@ -681,6 +742,12 @@ class GroupMuterPlugin(MaiBotPlugin):
 
         Host 只在解析到非空 group_name 时才给出站消息填 group_info，
         group_id 取不到时按 session_id 回退识别目标群，避免拦截静默失效。
+
+        error_policy=SKIP 意味着本 handler 自身异常/超时是 **fail-open**：
+        Host 跳过本 handler 继续发送，静音期间漏发一条。换 ErrorPolicy.ABORT
+        可得真 fail-closed（Host 端异常时置 aborted），但代价是本 handler
+        出 bug 时会拦掉**所有群**的全部出站消息。当前 handler 全内存操作、
+        几乎不可能异常，维持 SKIP 是有意的权衡。
         """
         context = MessageContext.from_message(message)
         group_id = context.group_id or self._mute_status.group_for_stream(context.stream_id)
