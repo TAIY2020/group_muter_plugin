@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "2.3.0",
+  "version": "2.4.0",
   "name": "群聊静音插件 | GroupMuter Plugin",
   "description": "一个允许管理员通过聊天命令、或麦麦主动让指定群聊临时进入“静音状态”（闭嘴）的群组管理插件。",
   "author": {
@@ -24,7 +24,10 @@
   },
   "dependencies": [],
   "capabilities": [
-    "send.text"
+    "send.text",
+    "frequency.get_adjust",
+    "frequency.set_adjust",
+    "chat.get_group_streams"
   ],
   "i18n": {
     "default_locale": "zh-CN",

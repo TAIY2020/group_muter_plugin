@@ -1,14 +1,14 @@
 """群聊静音插件 — MaiBot SDK v2
 
 允许管理员通过聊天命令，让麦麦在指定群聊中临时进入“静音状态”。
-静音期间，所有群消息将被拦截，不会触发麦麦的思考和回复。
+静音期间默认会让麦麦以发言频率 0 纯窥屏；关闭该功能时才会入站拦截所有群消息。
 管理员可通过关键词指令或 @麦麦 解除静音。
 
 实现方案：
     1. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook。
        此 Hook 在消息预处理完成后、Command 匹配之前触发，
-       可以通过返回 {"action": "abort"} 拦截消息，阻止其进入后续流程。
-    2. 主动沉默：注册 silence / sleep Tool，允许麦麦自主决定进入指定时长的沉默。
+       控制指令会通过返回 {"action": "abort"} 消费；普通消息在纯窥屏模式下放行。
+    2. 主动沉默：注册 silence Tool，允许麦麦自主决定进入指定时长的沉默。
     3. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
        此 Hook 在消息即将发送前触发，用于拦截静音前已进入思考流程、
        但在静音后才生成回复的"漏网"消息。
@@ -16,16 +16,17 @@
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 import asyncio
 import logging
 import re
 import time
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "2.2.0"
+CONFIG_SCHEMA_VERSION = "2.2.1"
 
 # 预编译正则：匹配 CQ at 码或 @前缀
 _AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
@@ -62,6 +63,9 @@ _REFUSE_REPLY_COOLDOWN_SECONDS = 30.0
 _MUTE_DURATION_MIN_SECONDS = 60
 _MUTE_DURATION_MAX_SECONDS = 86400
 _TOOL_MUTE_MAX_DEFAULT_SECONDS = 10800
+
+# 纯窥屏回读校验的浮点容差：set_adjust(0) 后回读 get_adjust，> 此值视为未归零（假成功）
+_PEEK_FREQUENCY_EPSILON = 1e-6
 
 
 # --- 配置模型 ---
@@ -147,6 +151,14 @@ class MuteSection(PluginConfigBase):
         description="非管理员尝试触发静音时麦麦的拒绝回复语",
         json_schema_extra={"label": "拒绝权限回复语"},
     )
+    learn_while_muted: bool = Field(
+        default=True,
+        description="静音期间是否继续让麦麦读取群聊上下文（发言频率置 0 纯窥屏）",
+        json_schema_extra={
+            "label": "静音时窥屏",
+            "hint": "启用后静音期间普通群消息不再被入站吞掉，而是交给上游以发言频率 0 的纯窥屏模式处理。",
+        },
+    )
 
     @field_validator("mute_keywords", "unmute_keywords", mode="before")
     @classmethod
@@ -186,6 +198,23 @@ class MuteSection(PluginConfigBase):
                 number, _MUTE_DURATION_MIN_SECONDS, _MUTE_DURATION_MAX_SECONDS, clamped,
             )
         return clamped
+
+    @model_validator(mode="after")
+    def _warn_keyword_overlap(self) -> "MuteSection":
+        """静音 / 解除关键词重叠时高可见度告警。
+
+        同一个词若同时落在两个列表里，其命中行为完全由 MuteIntentResolver 的
+        判定顺序决定（已静音时'解除'优先于'续期'），用户多半未意识到这层歧义。
+        只读告警、不修改字段，故 validate_assignment 重跑本 after 校验时幂等。
+        """
+        overlap = sorted(set(self.mute_keywords) & set(self.unmute_keywords))
+        if overlap:
+            logger.warning(
+                "mute_keywords 与 unmute_keywords 存在重叠词 %s：静音中收到这些词会被判为"
+                "'解除'而非'续期'，请确认是否符合预期。",
+                overlap,
+            )
+        return self
 
 
 class UserControlSection(PluginConfigBase):
@@ -229,6 +258,13 @@ class UserControlSection(PluginConfigBase):
             return "whitelist"
         if normalized == "blacklist":
             return "blacklist"
+        if normalized:
+            # 非空但拼错（如 "blacklsit"）才告警——空值是未配置、静默用默认即可；
+            # 否则用户误以为启用了黑名单、实际回退成白名单会让全员失权而无声。
+            logger.warning(
+                "user_control.list_type=%r 非法，已回退为 whitelist（合法值：whitelist / blacklist）",
+                value,
+            )
         return "whitelist"
 
 
@@ -241,6 +277,14 @@ class ToolSection(PluginConfigBase):
         default=True,
         description="是否允许麦麦通过 LLM 工具主动进入沉默",
         json_schema_extra={"label": "启用主动沉默工具"},
+    )
+    require_admin: bool = Field(
+        default=False,
+        description="是否仅允许管理员所在的对话诱导麦麦主动沉默",
+        json_schema_extra={
+            "label": "主动沉默仅限管理员",
+            "hint": "开启后，只有 user_control 名单中的管理员触发的对话才能让麦麦通过 silence 工具进入沉默；与非管理员对话时（或解析不出发起用户时）即使模型想沉默也会被拒。默认关闭——任何人都可礼貌请求麦麦安静。",
+        },
     )
     default_duration_seconds: int = Field(
         default=600,
@@ -281,6 +325,19 @@ class ToolSection(PluginConfigBase):
             return value
         return min(max(number, _MUTE_DURATION_MIN_SECONDS), _MUTE_DURATION_MAX_SECONDS)
 
+    @model_validator(mode="after")
+    def _warn_default_exceeds_max(self) -> "ToolSection":
+        """默认时长大于上限时提示用户最终会被裁剪。"""
+        if self.default_duration_seconds > self.max_duration_seconds:
+            logger.warning(
+                "tool.default_duration_seconds=%s 大于 tool.max_duration_seconds=%s；"
+                "silence 工具未指定时长时会按上限 %s 秒执行。",
+                self.default_duration_seconds,
+                self.max_duration_seconds,
+                self.max_duration_seconds,
+            )
+        return self
+
 
 class GroupMuterConfig(PluginConfigBase):
     """群聊静音插件完整配置。"""
@@ -303,7 +360,7 @@ class MuteSessionTracker:
     持有的状态：
         * 每群剩余静音时长（group_id → expire_at）
         * 群名缓存（日志友好显示）
-        * 每群 stream_id（出站消息缺 group_info 时按 session_id 回退识别）
+        * 每群 stream_id（出站消息缺 group_info 且无 platform_io_target_group_id 时按 session_id 回退识别）
         * 单次性发送豁免令牌（group_id → {预期文本: 截止时间}，
           绑定文本防 bot 在途回复抢消费；多键共存防续期顶掉在途令牌）
         * 后台摘要任务（周期性输出仍静音群的剩余时间）
@@ -312,13 +369,17 @@ class MuteSessionTracker:
     热重载 → 状态丢失是接受的行为，见 docs/adr/0001-mute-tracker-no-persistence.md。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_expire: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
         self._mute_until: Dict[str, float] = {}
         self._group_names: Dict[str, str] = {}
         self._stream_ids: Dict[str, str] = {}  # group_id → stream_id（出站守卫的回退匹配键）
         self._send_exempt: Dict[str, Dict[str, float]] = {}  # group_id → {预期文本: 豁免截止时间戳}
         self._summary_task: Optional[asyncio.Task] = None  # 后台摘要日志定时任务
         self._last_msg_log_time: Dict[str, float] = {}  # 消息驱动日志的节流时间戳
+        self._on_expire = on_expire
 
     def display_name(self, group_id: str) -> str:
         """返回日志显示用的群名；缺失时回退为 group_id。"""
@@ -378,8 +439,9 @@ class MuteSessionTracker:
         """开启指定群的静音状态，并启动后台摘要日志任务。
 
         ``stream_id`` 供出站守卫做回退匹配：Host 构建出站消息时只有解析到
-        非空 group_name 才会填 group_info，群名缺失时出站 dict 里没有
-        group_id，只能靠 session_id 识别目标群。
+        非空 group_name 才会填 group_info，群名缺失时出站 dict 里没有 group_id；
+        MessageContext 会先退读 additional_config.platform_io_target_group_id，
+        都取不到才靠 session_id 识别目标群。
         """
         self._mute_until[group_id] = time.time() + seconds
         if group_name:
@@ -399,12 +461,14 @@ class MuteSessionTracker:
         """
         if self._mute_until.pop(group_id, None) is not None:
             group_name = self._group_names.pop(group_id, None)
-            self._stream_ids.pop(group_id, None)
+            stream_id = self._stream_ids.pop(group_id, None) or ""
             self._send_exempt.pop(group_id, None)
             self._last_msg_log_time.pop(group_id, None)
             display_name = group_name or group_id
             if expired:
                 logger.info(f"[{display_name}] 静音时间已到，自动解除。")
+                if self._on_expire:
+                    self._on_expire(group_id, stream_id)
             else:
                 logger.info(f"[{display_name}] 已解除静音模式。")
 
@@ -435,6 +499,14 @@ class MuteSessionTracker:
             if known_stream_id == stream_id:
                 return group_id
         return ""
+
+    def stream_for_group(self, group_id: str) -> str:
+        """返回已记录的群聊 stream_id；未命中返回空串。"""
+        return self._stream_ids.get(group_id, "")
+
+    def has_mute_session(self, group_id: str) -> bool:
+        """判断是否存在静音会话记录（即使刚好已经过期）。"""
+        return group_id in self._mute_until
 
     def _ensure_summary_task(self) -> None:
         """确保后台摘要日志任务正在运行。如果已停止或未启动，则创建新任务。"""
@@ -528,22 +600,34 @@ def _strip_at_prefix(text: str) -> str:
     return _AT_PREFIX_PATTERN.sub("", text).strip()
 
 
-def _is_keyword_in_text(text: str, keywords: List[str]) -> bool:
+def _is_keyword_in_text(
+    text: str,
+    keywords: List[str],
+    *,
+    allow_at_suffix_match: bool = False,
+) -> bool:
     """检查文本（去除 CQ 码 / @前缀后）是否匹配关键词列表中的某个词。
 
     主路径是剥掉 ``[CQ:at,...]`` 与 ``@\\S+`` 后精确匹配；剥后为空串
     （纯 @ 消息）不参与匹配——配置层 ``_drop_blank_keywords`` 已剔除空
-    关键词，这里是对称防御。但 at 段在
+    关键词，这里是对称防御。
+
+    ``allow_at_suffix_match`` 控制 @ 开头的后缀兜底：at 段在
     processed_plain_text 中渲染为 "@群名片"，QQ 群名片可含空格，
-    ``@\\S+`` 剥不干净（如 "@张 三 Mute True" 剥后残留 "三 Mute True"）。
-    兜底：剥掉 CQ 码后若以 "@" 开头，允许"以关键词结尾"的后缀匹配——
-    仅对 @ 开头的消息放宽，普通聊天文本仍要求精确匹配。
+    ``@\\S+`` 剥不干净（如 "@张 三 Mute True" 剥后残留 "三 Mute True"），
+    精确匹配会失配。兜底允许"以关键词结尾"的后缀匹配补救。但纯文本层无法
+    区分"@名片 + 关键词"与"@路人 + 一句恰好以关键词结尾的正文"，后缀匹配
+    天然偏宽，故仅在调用方确认本条消息确实 @ 了 bot 自己时
+    （``is_bot_mentioned``）才放开——@ 路人的闲聊即使以关键词结尾也不会被
+    误判成指令。默认 False（收紧），调用方按需显式放开。
     """
     if not text or not keywords:
         return False
     stripped = _strip_at_prefix(text)
     if stripped and stripped in keywords:
         return True
+    if not allow_at_suffix_match:
+        return False
     no_cq = _CQ_AT_PATTERN.sub("", text).strip()
     if no_cq.startswith("@"):
         return any(no_cq.endswith(keyword) for keyword in keywords if keyword)
@@ -585,11 +669,16 @@ class MessageContext:
         msg_info = message.get("message_info") or {}
         user_info = msg_info.get("user_info") or {}
         group_info = msg_info.get("group_info") or {}
+        additional_config = msg_info.get("additional_config") or {}
 
         return cls(
             plain_text=str(plain_text),
             stream_id=str(message.get("session_id") or ""),
-            group_id=str(group_info.get("group_id") or ""),
+            group_id=str(
+                group_info.get("group_id")
+                or additional_config.get("platform_io_target_group_id")
+                or ""
+            ),
             group_name=str(group_info.get("group_name") or ""),
             user_id=str(user_info.get("user_id") or ""),
             is_bot_mentioned=bool(message.get("is_at") or message.get("is_mentioned")),
@@ -616,6 +705,13 @@ class AdminRoster:
         """从配置节重建判定缓存。"""
         self._list_type = user_control.list_type
         self._user_set = {str(u) for u in user_control.list}
+        if self._list_type == "blacklist" and not self._user_set:
+            # 黑名单语义是"不在名单内的人都有权限"，空名单 = 全员可操作静音（含主动沉默关键词）。
+            # 这通常不是本意（多半想要白名单），on_load / 配置变更时高可见度提醒。
+            logger.warning(
+                "user_control 为黑名单模式且名单为空——当前所有用户都可操作静音；"
+                "若非本意，请切换为 whitelist 或填写黑名单 QQ。"
+            )
 
     def is_admin(self, user_id: str) -> bool:
         """判定用户是否拥有静音操作权限；空 user_id 一律视为无权限。"""
@@ -680,7 +776,11 @@ class MuteIntentResolver:
 
         # --- 未静音 ---
         if not muted:
-            if _is_keyword_in_text(context.plain_text, mute_config.mute_keywords):
+            if _is_keyword_in_text(
+                context.plain_text,
+                mute_config.mute_keywords,
+                allow_at_suffix_match=context.is_bot_mentioned,
+            ):
                 if is_admin:
                     return MuteIntent(
                         kind="start_mute",
@@ -704,14 +804,22 @@ class MuteIntentResolver:
         if (
             is_admin
             and mute_config.enable_unmute
-            and _is_keyword_in_text(context.plain_text, mute_config.unmute_keywords)
+            and _is_keyword_in_text(
+                context.plain_text,
+                mute_config.unmute_keywords,
+                allow_at_suffix_match=context.is_bot_mentioned,
+            )
         ):
             return MuteIntent(
                 kind="end_mute",
                 group_id=context.group_id,
                 stream_id=context.stream_id,
             )
-        if is_admin and _is_keyword_in_text(context.plain_text, mute_config.mute_keywords):
+        if is_admin and _is_keyword_in_text(
+            context.plain_text,
+            mute_config.mute_keywords,
+            allow_at_suffix_match=context.is_bot_mentioned,
+        ):
             # 静音中管理员再发静音关键词 → 续期（重置计时），不再静默吞掉
             return MuteIntent(
                 kind="renew_mute",
@@ -726,7 +834,30 @@ class MuteIntentResolver:
                 stream_id=context.stream_id,
             )
 
-        return MuteIntent(kind="intercept_while_muted", group_id=context.group_id)
+        return MuteIntent(
+            kind="intercept_while_muted",
+            group_id=context.group_id,
+            group_name=context.group_name,
+            stream_id=context.stream_id,
+        )
+
+
+# --- per-stream 频率锁 ---
+
+
+@dataclass
+class _RefCountedLock:
+    """带引用计数的 per-stream 频率锁封装。
+
+    引用计数让锁"用完即弃"而不长期累积：进入临界区前 ``refs += 1``、
+    退出后 ``refs -= 1``，两者都是无 await 的同步操作，故 ``refs`` 归零
+    即代表此刻无任何协程持有或等待该锁——只有这时 pop 才安全。若在仍
+    有等待者时删除，后来的协程会 setdefault 出一把新锁、与等待旧锁的
+    协程互不互斥（锁分裂），反而失去串行化保证。
+    """
+
+    lock: asyncio.Lock
+    refs: int = 0
 
 
 # --- 主插件类 ---
@@ -744,12 +875,27 @@ class GroupMuterPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._admin_roster = AdminRoster()  # 权限判定缓存，on_load / on_config_update 时 refresh
-        # 实例字段而非类变量：避免热重载时旧实例 on_unload 抹掉新实例状态
-        self._mute_status = MuteSessionTracker()
         # 后台控制消息发送任务的强引用：create_task 后不存引用会被 GC 提前回收
         self._send_tasks: set[asyncio.Task] = set()
+        # 静音指令触发后的后台窥屏任务：避免入站 Hook 等频率 RPC 导致 abort 超时丢失
+        self._peek_tasks: set[asyncio.Task] = set()
+        # 实例字段而非类变量：避免热重载时旧实例 on_unload 抹掉新实例状态
+        self._mute_status = MuteSessionTracker(self._schedule_expired_frequency_restore)
         # refuse_start 拒绝回复的同群节流时间戳
         self._refuse_reply_last: Dict[str, float] = {}
+        # learn_while_muted 会把发言频率调整为 0，解除/卸载时需要恢复原值
+        self._frequency_restore_values: Dict[str, float] = {}
+        # 已回读确认频率归零（窥屏真生效）的 stream，短路后续重复 set/回读两次 RPC；
+        # 与 _frequency_restore_values 同生命周期，在 _restore_frequency_adjustment 清理
+        self._peek_confirmed: set[str] = set()
+        # per-stream 频率锁（引用计数、用完即弃）：入站守卫、出站守卫、后台过期任务
+        # 三条独立路径会并发 set_adjust 同一 stream，不串行化则"进入窥屏"的
+        # set_adjust(0) 可能在"解除/过期"的 set_adjust(original) 之后落地，频率永久卡 0。
+        self._freq_locks: Dict[str, _RefCountedLock] = {}
+        # on_unload 期间置 True：让在途的 _enter_peek_mode fail-closed 退出，避免它在
+        # _restore_all_frequency_adjustments 跑完之后又 set_adjust(0)，把某 stream 的
+        # 频率永久留在 0（且被下一代实例的 get_adjust 误读为原始 baseline）。
+        self._unloading = False
 
     async def on_load(self) -> None:
         self._admin_roster.refresh(self.config.user_control)
@@ -763,8 +909,19 @@ class GroupMuterPlugin(MaiBotPlugin):
         不取消会让旧实例无法被 GC；cancel() 是异步信号，必须 await 等 task
         真正退出，否则 Runner 释放实例后 task 仍可能触达已失效字段。
         后台控制消息发送任务同理。
+
+        卸载首先置 _unloading=True：在途入站守卫可能正卡在 _enter_peek_mode 的
+        set_adjust RPC 上，标志让它在拿锁后复查时 fail-closed 退出，确保
+        _restore_all_frequency_adjustments 之后没有任何路径再把频率摁回 0。
         """
+        self._unloading = True
         await self._mute_status.cancel_summary_task()
+        for task in list(self._peek_tasks):
+            task.cancel()
+        if self._peek_tasks:
+            await asyncio.gather(*self._peek_tasks, return_exceptions=True)
+        self._peek_tasks.clear()
+        await self._restore_all_frequency_adjustments()
         for task in list(self._send_tasks):
             task.cancel()
         if self._send_tasks:
@@ -775,20 +932,22 @@ class GroupMuterPlugin(MaiBotPlugin):
         """配置热重载回调。"""
         if scope == "self":
             self._admin_roster.refresh(self.config.user_control)
+            if not self.config.mute.learn_while_muted:
+                await self._restore_all_frequency_adjustments()
 
     @Tool(
         "silence",
         description=(
-            "让麦麦在当前群聊主动进入沉默状态，之后该群消息会被静音守卫拦截，"
-            "直到超时或管理员解除。适合觉得自己话太多、气氛不适合继续发言、"
+            "让麦麦在当前群聊主动进入沉默，不主动发言，直到超时或管理员解除。"
+            "适合觉得自己话太多、气氛不适合继续发言、"
             "或用户礼貌要求安静一段时间时调用。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="stream_id",
                 param_type=ToolParamType.STRING,
-                description="当前聊天流 ID。通常由上下文提供，必须是群聊聊天流。",
-                required=True,
+                description="当前聊天流 ID，通常由系统上下文自动注入、一般无需填写；必须是群聊聊天流。",
+                required=False,
             ),
             ToolParameterInfo(
                 name="duration_seconds",
@@ -808,7 +967,7 @@ class GroupMuterPlugin(MaiBotPlugin):
     )
     async def handle_silence_tool(
         self,
-        stream_id: str,
+        stream_id: str = "",
         duration_seconds: Optional[int] = None,
         reason: str = "",
         **kwargs: Any,
@@ -819,51 +978,6 @@ class GroupMuterPlugin(MaiBotPlugin):
             duration_seconds=duration_seconds,
             reason=reason,
             tool_name="silence",
-            **kwargs,
-        )
-
-    @Tool(
-        "sleep",
-        description=(
-            "silence 的别名：让麦麦在当前群聊主动休眠/沉默指定时长。"
-            "当你判断自己应暂时不参与聊天时调用。"
-        ),
-        parameters=[
-            ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID。通常由上下文提供，必须是群聊聊天流。",
-                required=True,
-            ),
-            ToolParameterInfo(
-                name="duration_seconds",
-                param_type=ToolParamType.INTEGER,
-                description="休眠/沉默时长（秒），可选；不填使用插件默认值，过大会按配置上限收敛。",
-                required=False,
-                default=None,
-            ),
-            ToolParameterInfo(
-                name="reason",
-                param_type=ToolParamType.STRING,
-                description="主动休眠原因，便于日志记录；不会发送到群里。",
-                required=False,
-                default="",
-            ),
-        ],
-    )
-    async def handle_sleep_tool(
-        self,
-        stream_id: str,
-        duration_seconds: Optional[int] = None,
-        reason: str = "",
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """LLM 工具入口：sleep 是 silence 的语义别名。"""
-        return await self._handle_active_mute_tool(
-            stream_id=stream_id,
-            duration_seconds=duration_seconds,
-            reason=reason,
-            tool_name="sleep",
             **kwargs,
         )
 
@@ -885,8 +999,9 @@ class GroupMuterPlugin(MaiBotPlugin):
         如果消息目标群处于静音状态，则 abort 阻止发送。
         仅拦截 bot 主动回复（非插件自身发送的控制消息）。
 
-        Host 只在解析到非空 group_name 时才给出站消息填 group_info，
-        group_id 取不到时按 session_id 回退识别目标群，避免拦截静默失效。
+        Host 只在解析到非空 group_name 时才给出站消息填 group_info；group_info
+        缺失时退读 additional_config.platform_io_target_group_id（适配器出站路由同款
+        字段），仍取不到才按 session_id 回退识别目标群，避免拦截静默失效。
 
         error_policy=SKIP 意味着本 handler 自身异常/超时是 **fail-open**：
         Host 跳过本 handler 继续发送，静音期间漏发一条。换 ErrorPolicy.ABORT
@@ -899,6 +1014,8 @@ class GroupMuterPlugin(MaiBotPlugin):
         if not group_id:
             return None
 
+        known_stream_id = context.stream_id or self._mute_status.stream_for_group(group_id)
+        had_session = self._mute_status.has_mute_session(group_id)
         if self._mute_status.is_muted(group_id):
             # 检查并消耗豁免令牌：绑定预期文本，bot 的在途回复抢不走
             if self._mute_status.consume_exempt(group_id, context.plain_text):
@@ -906,6 +1023,9 @@ class GroupMuterPlugin(MaiBotPlugin):
             display_name = self._mute_status.display_name(group_id)
             logger.info(f"[{display_name}] 静音中，拦截出站消息")
             return {"action": "abort"}
+
+        if had_session:
+            await self._restore_frequency_adjustment(known_stream_id)
 
         return None
 
@@ -930,9 +1050,15 @@ class GroupMuterPlugin(MaiBotPlugin):
         """
         context = MessageContext.from_message(message)
 
+        known_stream_id = context.stream_id or self._mute_status.stream_for_group(context.group_id)
+        had_session = self._mute_status.has_mute_session(context.group_id)
+        muted = self._mute_status.is_muted(context.group_id)
+        if had_session and not muted:
+            await self._restore_frequency_adjustment(known_stream_id)
+
         intent = MuteIntentResolver.resolve(
             context=context,
-            muted=self._mute_status.is_muted(context.group_id),
+            muted=muted,
             is_admin=self._admin_roster.is_admin(context.user_id),
             mute_config=self.config.mute,
         )
@@ -967,6 +1093,11 @@ class GroupMuterPlugin(MaiBotPlugin):
                 intent.group_name or None,
                 stream_id=intent.stream_id or None,
             )
+            self._spawn_peek_mode_entry(
+                intent.stream_id,
+                intent.group_id,
+                label=intent.kind,
+            )
             self._mute_status.set_send_exempt(intent.group_id, reply)
             self._spawn_control_send(reply, intent.stream_id, label=intent.kind)
             return {"action": "abort"}
@@ -982,18 +1113,48 @@ class GroupMuterPlugin(MaiBotPlugin):
             return {"action": "abort"}
 
         if intent.kind == "end_mute":
+            stream_id = intent.stream_id or self._mute_status.stream_for_group(intent.group_id)
             self._mute_status.clear_mute(intent.group_id)
             self._refuse_reply_last.pop(intent.group_id, None)
+            await self._restore_frequency_adjustment(stream_id)
+            # 用 fallback 后的 stream_id 发送：入站消息缺 session_id 而 tracker 有缓存时，
+            # 沿用原始 intent.stream_id（空）会让频率恢复成功、解除回复却发不出。
             self._spawn_control_send(
-                self.config.mute.unmute_reply, intent.stream_id, label="end_mute",
+                self.config.mute.unmute_reply, stream_id, label="end_mute",
             )
             return {"action": "abort"}
 
         if intent.kind == "intercept_while_muted":
             self._mute_status.log_on_message(intent.group_id)
+            if self.config.mute.learn_while_muted:
+                if await self._enter_peek_mode(intent.stream_id, intent.group_id):
+                    return None
+                logger.warning(
+                    "[mute_guard] 纯窥屏模式不可用，退回入站拦截 (stream=%s)",
+                    intent.stream_id,
+                )
             return {"action": "abort"}
 
         return None
+
+    def _spawn_peek_mode_entry(self, stream_id: str, group_id: str, *, label: str) -> None:
+        """后台进入纯窥屏模式，避免控制指令 Hook 等待频率 RPC。"""
+        if not self.config.mute.learn_while_muted or not stream_id or self._unloading:
+            return
+
+        async def runner() -> None:
+            ok = await self._enter_peek_mode(stream_id, group_id)
+            if not ok and self._mute_status.is_muted(group_id):
+                logger.warning(
+                    "[mute_guard] %s 后台进入纯窥屏失败，后续静音消息将退回入站拦截 (stream=%s, group=%s)",
+                    label,
+                    stream_id,
+                    group_id,
+                )
+
+        task = asyncio.create_task(runner())
+        self._peek_tasks.add(task)
+        task.add_done_callback(self._peek_tasks.discard)
 
     async def _handle_active_mute_tool(
         self,
@@ -1004,9 +1165,21 @@ class GroupMuterPlugin(MaiBotPlugin):
         tool_name: str,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """处理 silence / sleep 工具调用。"""
+        """处理 silence 工具调用。"""
         if not self.config.tool.enabled:
             return {"success": False, "message": "主动沉默工具已在配置中关闭"}
+
+        # require_admin：仅允许管理员所在的对话诱导主动沉默。Host 工具调用会把当前对话
+        # 锚点消息的发送者注入 kwargs["user_id"]；解析不出发起人时 is_admin("") 为 False，
+        # fail-closed 拒绝——要收紧就宁拒勿误放。
+        if self.config.tool.require_admin:
+            caller_id = str(kwargs.get("user_id") or "")
+            if not self._admin_roster.is_admin(caller_id):
+                logger.info(
+                    "[mute_guard] 主动沉默被拒：require_admin 开启，当前对话用户非管理员 (user_id=%s)",
+                    caller_id or "<empty>",
+                )
+                return {"success": False, "message": "主动沉默已限定为仅管理员可触发"}
 
         context = await self._resolve_tool_context(stream_id=stream_id, **kwargs)
         if not context.stream_id:
@@ -1022,6 +1195,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             context.group_name or None,
             stream_id=context.stream_id,
         )
+        await self._enter_peek_mode(context.stream_id, context.group_id)
 
         logger.info(
             "[%s] 麦麦通过 %s 工具主动进入沉默，持续 %s 秒。reason=%s",
@@ -1050,13 +1224,20 @@ class GroupMuterPlugin(MaiBotPlugin):
                 seconds = int(duration_seconds)
             except (TypeError, ValueError):
                 seconds = default_seconds
-        seconds = min(max(seconds, _MUTE_DURATION_MIN_SECONDS), max_seconds)
-        return min(seconds, _MUTE_DURATION_MAX_SECONDS)
+        # max_seconds 已被配置层 le=_MUTE_DURATION_MAX_SECONDS 与 _clamp_tool_duration
+        # 收敛到全局上界内，clamp 到 [MIN, max_seconds] 即落在合法区间，无需再夹一次。
+        return min(max(seconds, _MUTE_DURATION_MIN_SECONDS), max_seconds)
 
     async def _resolve_tool_context(self, stream_id: str, **kwargs: Any) -> MessageContext:
         """从工具上下文与 Chat 能力中解析群聊上下文。"""
-        sid = str(stream_id or kwargs.get("stream_id") or kwargs.get("session_id") or "")
-        group_id = str(kwargs.get("group_id") or "")
+        sid = str(
+            stream_id
+            or kwargs.get("stream_id")
+            or kwargs.get("session_id")
+            or kwargs.get("chat_id")
+            or ""
+        ).strip()
+        group_id = str(kwargs.get("group_id") or "").strip()
         group_name = str(kwargs.get("group_name") or "")
 
         if not group_id:
@@ -1091,6 +1272,176 @@ class GroupMuterPlugin(MaiBotPlugin):
                 break
 
         return MessageContext(stream_id=sid, group_id=group_id, group_name=group_name)
+
+    @asynccontextmanager
+    async def _stream_freq_lock(self, stream_id: str):
+        """串行化同一 stream 的频率读写（set_adjust / get_adjust）。
+
+        入站守卫（进入窥屏）、出站守卫与后台过期任务（恢复频率）是三条独立
+        触发、会并发执行的路径，且 Host 不对同一 stream 的入站消息处理串行
+        加锁。无此锁时，"进入窥屏"的 set_adjust(0) 与"解除/过期"的
+        set_adjust(original) 会在 RPC 往返间交错落地——若前者最后生效，群被
+        解除静音后发言频率仍永久停在 0（纯窥屏不退出）。
+
+        按 stream 惰性建锁、引用计数回收（见 _RefCountedLock）：建锁与
+        refs 自增之间无 await，故不会并发建出两把锁；refs 归零即 pop。
+        """
+        entry = self._freq_locks.get(stream_id)
+        if entry is None:
+            entry = self._freq_locks[stream_id] = _RefCountedLock(asyncio.Lock())
+        entry.refs += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.refs -= 1
+            if entry.refs == 0 and self._freq_locks.get(stream_id) is entry:
+                self._freq_locks.pop(stream_id, None)
+
+    async def _enter_peek_mode(self, stream_id: str, group_id: str = "") -> bool:
+        """静音期间把当前聊天流发言频率调整为 0，让上游走纯窥屏路径。
+
+        返回值语义是"窥屏路径是否可用、消息可否放行进主链"，**不是**"频率一定已归零"：
+
+        * set_adjust 抛异常 / 返回 False（Host 端真失败）→ 返回 False，调用方
+          fail-closed 退回入站拦截，宁可吞消息也不冒险让麦麦发言。
+        * set_adjust 报成功但回读发现频率未归零（"假成功"，见下）→ 仍返回 True 放行。
+          此时窥屏的"省算力"优化没生效，但放行能让 maisaka 为该会话创建 runtime 实例、
+          并继续读取上下文（满足 learn_while_muted 的学习诉求）；这一条若被麦麦生成回复，
+          由 before_send 出站守卫兜底拦截，不会漏发；下一条消息 set_adjust 即可命中实例
+          真正归零，自愈。若改为退回拦截，消息被吞 → 实例永不创建 → 每条都假成功 →
+          学习彻底失效且永远无法自愈。
+
+        "假成功"根因：Host 端 ``heartflow_manager.adjust_talk_frequency`` 在目标会话
+        尚无活跃 runtime 实例时只打 warning、不做任何事，但 capability 仍返回
+        success=True。入站 after_process Hook 早于消息落入 maisaka 创建实例，冷群 /
+        bot 刚重启 / 实例被 LRU 淘汰时就会命中。``get_adjust`` 在实例缺失时返回 1.0，
+        据此回读识破。
+
+        已确认归零的 stream 记入 ``_peek_confirmed`` 短路：后续 intercept 直接放行，
+        省掉每条消息重复的 set_adjust + 回读两次 RPC；解除静音 / 恢复频率时清空。
+
+        已知盲区：此回读查不出 focus 模式——focus 开启时上游
+        ``_get_effective_reply_frequency`` 恒返回 1.0、无视 adjust，但 adjust 本身仍被
+        设为 0、回读也是 0，无法区分。该场景同样由 before_send 出站守卫兜底，不会漏发。
+
+        ``group_id`` 用于持锁后复查静音是否仍有效：拿到 per-stream 锁前可能在
+        ``async with`` 处排队，等锁期间该群静音可能已被解除 / 自然过期。若不复查就
+        set_adjust(0)，会把刚解除的群重新摁回纯窥屏（频率永久卡 0、无人再恢复）。
+        ``remaining_seconds`` 是纯读，已解除（无会话）/ 已过期都返回 0，据此 fail-closed
+        退回拦截。已确认归零（``_peek_confirmed``）的快速放行排在复查之前——至多让一条
+        恰好过期的消息多窥屏一次，由 on_expire 调度的恢复任务随后纠正，不会卡死。
+        """
+        if not self.config.mute.learn_while_muted or not stream_id or self._unloading:
+            return False
+        # 快速路径：已确认窥屏生效的会话直接放行，连锁都不必抢，
+        # 避免每条 intercept 消息重复 set/回读两次 RPC。
+        if stream_id in self._peek_confirmed:
+            return True
+        # 频率读写按 stream 串行：否则本协程的 set_adjust(0) 可能与另一路径
+        # "解除/过期"的 set_adjust(original) 交错落地，导致频率永久卡 0。
+        async with self._stream_freq_lock(stream_id):
+            # 锁内复查：等锁期间别的协程可能已把该 stream 确认归零。
+            if stream_id in self._peek_confirmed:
+                return True
+            # 锁内复查卸载标志：等锁期间 on_unload 可能已跑完 _restore_all，
+            # 此刻再 set_adjust(0) 会把频率永久留在 0，fail-closed 退出。
+            if self._unloading:
+                return False
+            # 持锁后复查静音是否仍有效：排队等锁期间该群可能已被解除 / 过期，
+            # 此时绝不能再 set_adjust(0)，否则解除后频率永久卡 0。remaining_seconds
+            # 纯读，已解除/过期均返回 0，据此 fail-closed 退回拦截。
+            if group_id and self._mute_status.remaining_seconds(group_id) <= 0:
+                logger.debug(
+                    "[mute_guard] 进入窥屏前复查发现静音已解除/过期，跳过频率归零 (stream=%s, group=%s)",
+                    stream_id, group_id,
+                )
+                return False
+            try:
+                if stream_id not in self._frequency_restore_values:
+                    original = await self.ctx.frequency.get_adjust(chat_id=stream_id)
+                    self._frequency_restore_values[stream_id] = float(original)
+                ok = await self.ctx.frequency.set_adjust(chat_id=stream_id, value=0.0)
+                # set_adjust 失败时返回 False 而非抛异常（SDK 归一化为布尔），
+                # 不检查会误以为窥屏已生效——消息被放行但频率没归零，麦麦照常发言。
+                if not ok:
+                    logger.warning(
+                        "[mute_guard] set_adjust 返回 False，纯窥屏未生效，退回入站拦截模式 (stream=%s)",
+                        stream_id,
+                    )
+                    return False
+                # 回读校验"假成功"：set_adjust 报成功不代表频率真归零（实例缺失时 Host
+                # 静默放行）。实例存在并归零 → 读到 0；实例缺失 → 读到 1.0。
+                effective = await self.ctx.frequency.get_adjust(chat_id=stream_id)
+            except Exception:
+                logger.warning(
+                    "[mute_guard] 设置发言频率为 0 失败，将退回入站拦截模式 (stream=%s)",
+                    stream_id,
+                    exc_info=True,
+                )
+                return False
+            if effective is None or float(effective) > _PEEK_FREQUENCY_EPSILON:
+                # 假成功：频率未归零，但仍放行让 maisaka 创建实例并继续学习（理由见 docstring）。
+                # 不记入 _peek_confirmed，下一条会重新尝试 set_adjust，实例就绪后即可真正归零。
+                logger.warning(
+                    "[mute_guard] set_adjust 报成功但回读频率=%s 未归零，目标会话可能尚无活跃 "
+                    "runtime 实例；本条仍放行以创建实例并继续学习，发言由出站守卫兜底，下条自愈 "
+                    "(stream=%s)",
+                    effective, stream_id,
+                )
+                return True
+            self._peek_confirmed.add(stream_id)
+            return True
+
+    async def _restore_frequency_adjustment(self, stream_id: str) -> None:
+        """恢复因纯窥屏模式临时覆盖的发言频率调整值。
+
+        set_adjust 失败（抛异常或返回 False）时保留 restore 值不 pop，留待
+        下次解除/卸载时重试，避免该聊天流的原始频率被永久停在 0（永久窥屏）。
+
+        与 _enter_peek_mode 共用 per-stream 频率锁串行执行，确保本次
+        set_adjust(original) 不会与并发的 set_adjust(0) 交错落地。
+        """
+        # 快速路径：没有待恢复值就连锁都不必抢。
+        if not stream_id or stream_id not in self._frequency_restore_values:
+            return
+        async with self._stream_freq_lock(stream_id):
+            # 锁内复查：等锁期间可能已被另一路径恢复并 pop。
+            original = self._frequency_restore_values.get(stream_id)
+            if original is None:
+                return
+            try:
+                ok = await self.ctx.frequency.set_adjust(chat_id=stream_id, value=original)
+            except Exception:
+                logger.warning(
+                    "[mute_guard] 恢复发言频率调整值失败 (stream=%s, value=%s)",
+                    stream_id,
+                    original,
+                    exc_info=True,
+                )
+                return
+            if not ok:
+                logger.warning(
+                    "[mute_guard] 恢复发言频率调整值失败，set_adjust 返回 False，保留待重试 (stream=%s, value=%s)",
+                    stream_id,
+                    original,
+                )
+                return
+            self._frequency_restore_values.pop(stream_id, None)
+            self._peek_confirmed.discard(stream_id)
+
+    async def _restore_all_frequency_adjustments(self) -> None:
+        """插件卸载时恢复所有仍处于纯窥屏覆盖的聊天流。"""
+        for stream_id in list(self._frequency_restore_values):
+            await self._restore_frequency_adjustment(stream_id)
+
+    def _schedule_expired_frequency_restore(self, group_id: str, stream_id: str) -> None:
+        """静音自然过期时异步恢复发言频率调整值。"""
+        if not stream_id:
+            return
+        task = asyncio.create_task(self._restore_frequency_adjustment(stream_id))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
 
     def _should_send_refusal(self, group_id: str) -> bool:
         """拒绝回复的同群节流：冷却期内返回 False，否则记录时间戳并放行。"""
