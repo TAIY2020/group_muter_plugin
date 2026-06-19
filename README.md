@@ -4,7 +4,7 @@
 
 这个插件为群组管理员提供了一个强大的工具来让麦麦“静音”（闭嘴）。当群聊需要专注讨论或减少麦麦干扰时，管理员可以一键“静音”麦麦。在静音模式下，麦麦将忽略所有消息，直到被管理员唤醒或到达静音时间自动解除静音。
 
-> 本版本基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，并注册 `silence` / `sleep` Tool 供麦麦主动进入沉默，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -12,6 +12,7 @@
 - **双重拦截**:
   - **入站拦截**: 通过 `chat.receive.after_process` Hook 在消息预处理后拦截，阻止消息进入后续流程。
   - **出站拦截**: 通过 `send_service.before_send` Hook 拦截静音前已进入思考流程、但在静音后才生成回复的“漏网”消息。
+- **主动沉默工具**: 注册 `silence` / `sleep` 两个 LLM Tool，麦麦可在判断自己不适合继续发言时主动让当前群聊进入沉默。
 - **多种唤醒方式**:
   - **命令唤醒**: 管理员使用特定关键词即可主动唤醒。
   - **@提及唤醒**: 管理员在群里 `@` 麦麦，即可立即唤醒麦麦。
@@ -37,30 +38,6 @@
 
 首次启动麦麦后，插件会在其目录下自动生成 `config.toml` 文件。配置管理员权限后重启麦麦主程序即可。你也可以通过 **Web UI** 在线修改配置，修改后会自动热重载生效。
 
-**默认配置示例**:
-
-```toml
-[plugin]
-name = "group_muter_plugin"
-config_version = "2.2.0"
-enabled = true
-
-[mute]
-duration_seconds = 1200
-mute_keywords = ["Mute True", "安安你去看书去"]
-unmute_keywords = ["Mute False", "安安别看了"]
-enable_unmute = true
-at_mention_break = true
-mute_reply = "好吧，那我去看会书📘，你们先聊..."
-renew_reply = "好哦，那我再多看一会书📘"
-unmute_reply = "我回来啦，你们聊啥呢🤔"
-no_permission_reply = "？？？你在教我做事🤡"
-
-[user_control]
-list_type = "whitelist"
-list = []
-```
-
 **⚠️ 重要安全提示**:
 
 - **`user_control.list`**: 这是一个**核心安全设置**。
@@ -85,6 +62,22 @@ list = []
 静音期间，管理员再次发送静音关键词即可**重置静音计时**（重新计满 `duration_seconds`）。
 
 - **麦麦回复**: 由 `mute.renew_reply` 配置（默认 `好哦，那我再多看一会书📘`）
+
+### 主动沉默（silence / sleep 工具）
+
+插件会向 MaiBot 注册 `silence` 与 `sleep` 两个 Tool。麦麦可以在以下场景自主调用：
+
+- 觉得自己话太多，应该暂时少参与讨论。
+- 群聊气氛不适合继续插话。
+- 用户礼貌要求麦麦安静一段时间。
+
+工具参数：
+
+- `stream_id`：当前聊天流 ID，必填，且必须是群聊聊天流。
+- `duration_seconds`：沉默时长（秒），可选；不填使用 `tool.default_duration_seconds`，超过 `tool.max_duration_seconds` 会自动收敛。
+- `reason`：主动沉默原因，可选，仅用于日志，不会发送到群里。
+
+主动沉默只修改静音状态，不额外发送提示消息；之后该群的入站/出站消息会按本插件原有静音守卫逻辑被拦截，直到超时或管理员解除。
 
 ### 解除静音
 
@@ -127,6 +120,9 @@ list = []
 | `mute.renew_reply` | str | `好哦，那我再多看一会书📘` | 静音期间管理员再次发送静音关键词（续期）时的回复语 |
 | `mute.unmute_reply` | str | `我回来啦，你们聊啥呢🤔` | 解除静音时麦麦的回复语（@解除与关键词解除共用） |
 | `mute.no_permission_reply` | str | `？？？你在教我做事🤡` | 非管理员尝试触发静音时的拒绝回复 |
+| `tool.enabled` | bool | `true` | 是否允许麦麦通过 `silence` / `sleep` 工具主动进入沉默 |
+| `tool.default_duration_seconds` | int | `600` | 工具未指定时长时的默认沉默时间（秒） |
+| `tool.max_duration_seconds` | int | `10800` | 工具可主动沉默的最大时长（秒） |
 
 #### 命令示例
 
@@ -146,6 +142,7 @@ v2.x 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 | 配置热重载 | 不支持 | 支持 `on_config_update` 回调 |
 | 日志过滤 | 自定义 `GroupMuterLogFilter` 过滤控制台日志 | 由 SDK 统一管理 |
 | 出站拦截 | 无（静音前进入思考的消息可能"漏网"） | `send_service.before_send` Hook 拦截漏网消息 |
+| 主动沉默 | `BaseAction` | `@Tool("silence")` / `@Tool("sleep")` |
 | 发送豁免 | 无 | 内置豁免机制，确保插件自身的控制消息不被拦截 |
 | 清单文件 | `manifest_version: 1` | `manifest_version: 2`，新增 `capabilities`、`i18n` 等字段 |
 

@@ -8,13 +8,14 @@
     1. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook。
        此 Hook 在消息预处理完成后、Command 匹配之前触发，
        可以通过返回 {"action": "abort"} 拦截消息，阻止其进入后续流程。
-    2. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
+    2. 主动沉默：注册 silence / sleep Tool，允许麦麦自主决定进入指定时长的沉默。
+    3. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
        此 Hook 在消息即将发送前触发，用于拦截静音前已进入思考流程、
        但在静音后才生成回复的"漏网"消息。
 """
 
-from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
-from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
+from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from pydantic import field_validator
 
 import asyncio
@@ -47,7 +48,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "2.1.2"
+CONFIG_SCHEMA_VERSION = "2.2.0"
 
 # 预编译正则：匹配 CQ at 码或 @前缀
 _AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
@@ -60,6 +61,7 @@ _REFUSE_REPLY_COOLDOWN_SECONDS = 30.0
 # 静音时长的合法区间（秒）：Field 校验、WebUI slider、clamp 兜底共用同一边界
 _MUTE_DURATION_MIN_SECONDS = 60
 _MUTE_DURATION_MAX_SECONDS = 86400
+_TOOL_MUTE_MAX_DEFAULT_SECONDS = 10800
 
 
 # --- 配置模型 ---
@@ -230,12 +232,63 @@ class UserControlSection(PluginConfigBase):
         return "whitelist"
 
 
+class ToolSection(PluginConfigBase):
+    """主动沉默工具配置。"""
+
+    __ui_label__ = "主动沉默工具"
+
+    enabled: bool = Field(
+        default=True,
+        description="是否允许麦麦通过 LLM 工具主动进入沉默",
+        json_schema_extra={"label": "启用主动沉默工具"},
+    )
+    default_duration_seconds: int = Field(
+        default=600,
+        description="工具未指定时长时的默认沉默时间（秒）",
+        ge=_MUTE_DURATION_MIN_SECONDS,
+        le=_MUTE_DURATION_MAX_SECONDS,
+        json_schema_extra={
+            "label": "默认沉默时长（秒）",
+            "hint": "60 ~ 86400 秒",
+            "x-widget": "slider",
+            "min": _MUTE_DURATION_MIN_SECONDS,
+            "max": _MUTE_DURATION_MAX_SECONDS,
+            "step": 60,
+        },
+    )
+    max_duration_seconds: int = Field(
+        default=_TOOL_MUTE_MAX_DEFAULT_SECONDS,
+        description="工具可主动沉默的最大时长（秒）",
+        ge=_MUTE_DURATION_MIN_SECONDS,
+        le=_MUTE_DURATION_MAX_SECONDS,
+        json_schema_extra={
+            "label": "主动沉默最大时长（秒）",
+            "hint": "建议不要过大，避免模型误判后长时间沉默",
+            "x-widget": "slider",
+            "min": _MUTE_DURATION_MIN_SECONDS,
+            "max": _MUTE_DURATION_MAX_SECONDS,
+            "step": 60,
+        },
+    )
+
+    @field_validator("default_duration_seconds", "max_duration_seconds", mode="before")
+    @classmethod
+    def _clamp_tool_duration(cls, value: Any) -> Any:
+        """工具时长配置沿用静音时长的容错收敛策略。"""
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return value
+        return min(max(number, _MUTE_DURATION_MIN_SECONDS), _MUTE_DURATION_MAX_SECONDS)
+
+
 class GroupMuterConfig(PluginConfigBase):
     """群聊静音插件完整配置。"""
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     mute: MuteSection = Field(default_factory=MuteSection)
     user_control: UserControlSection = Field(default_factory=UserControlSection)
+    tool: ToolSection = Field(default_factory=ToolSection)
 
 
 # --- 核心状态管理器 ---
@@ -597,6 +650,7 @@ class MuteIntent:
     group_id: str = ""
     group_name: str = ""
     stream_id: str = ""
+    duration_seconds: Optional[int] = None
 
 
 class MuteIntentResolver:
@@ -722,6 +776,97 @@ class GroupMuterPlugin(MaiBotPlugin):
         if scope == "self":
             self._admin_roster.refresh(self.config.user_control)
 
+    @Tool(
+        "silence",
+        description=(
+            "让麦麦在当前群聊主动进入沉默状态，之后该群消息会被静音守卫拦截，"
+            "直到超时或管理员解除。适合觉得自己话太多、气氛不适合继续发言、"
+            "或用户礼貌要求安静一段时间时调用。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="stream_id",
+                param_type=ToolParamType.STRING,
+                description="当前聊天流 ID。通常由上下文提供，必须是群聊聊天流。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="duration_seconds",
+                param_type=ToolParamType.INTEGER,
+                description="沉默时长（秒），可选；不填使用插件默认值，过大会按配置上限收敛。",
+                required=False,
+                default=None,
+            ),
+            ToolParameterInfo(
+                name="reason",
+                param_type=ToolParamType.STRING,
+                description="主动沉默原因，便于日志记录；不会发送到群里。",
+                required=False,
+                default="",
+            ),
+        ],
+    )
+    async def handle_silence_tool(
+        self,
+        stream_id: str,
+        duration_seconds: Optional[int] = None,
+        reason: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """LLM 工具入口：主动进入沉默。"""
+        return await self._handle_active_mute_tool(
+            stream_id=stream_id,
+            duration_seconds=duration_seconds,
+            reason=reason,
+            tool_name="silence",
+            **kwargs,
+        )
+
+    @Tool(
+        "sleep",
+        description=(
+            "silence 的别名：让麦麦在当前群聊主动休眠/沉默指定时长。"
+            "当你判断自己应暂时不参与聊天时调用。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="stream_id",
+                param_type=ToolParamType.STRING,
+                description="当前聊天流 ID。通常由上下文提供，必须是群聊聊天流。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="duration_seconds",
+                param_type=ToolParamType.INTEGER,
+                description="休眠/沉默时长（秒），可选；不填使用插件默认值，过大会按配置上限收敛。",
+                required=False,
+                default=None,
+            ),
+            ToolParameterInfo(
+                name="reason",
+                param_type=ToolParamType.STRING,
+                description="主动休眠原因，便于日志记录；不会发送到群里。",
+                required=False,
+                default="",
+            ),
+        ],
+    )
+    async def handle_sleep_tool(
+        self,
+        stream_id: str,
+        duration_seconds: Optional[int] = None,
+        reason: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """LLM 工具入口：sleep 是 silence 的语义别名。"""
+        return await self._handle_active_mute_tool(
+            stream_id=stream_id,
+            duration_seconds=duration_seconds,
+            reason=reason,
+            tool_name="sleep",
+            **kwargs,
+        )
+
     # ===== 核心 Hook 处理器 =====
 
     @HookHandler(
@@ -815,9 +960,10 @@ class GroupMuterPlugin(MaiBotPlugin):
                 if intent.kind == "start_mute"
                 else self.config.mute.renew_reply
             )
+            duration_seconds = intent.duration_seconds or self.config.mute.duration_seconds
             self._mute_status.set_mute(
                 intent.group_id,
-                self.config.mute.duration_seconds,
+                duration_seconds,
                 intent.group_name or None,
                 stream_id=intent.stream_id or None,
             )
@@ -848,6 +994,103 @@ class GroupMuterPlugin(MaiBotPlugin):
             return {"action": "abort"}
 
         return None
+
+    async def _handle_active_mute_tool(
+        self,
+        *,
+        stream_id: str,
+        duration_seconds: Optional[int],
+        reason: str,
+        tool_name: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """处理 silence / sleep 工具调用。"""
+        if not self.config.tool.enabled:
+            return {"success": False, "message": "主动沉默工具已在配置中关闭"}
+
+        context = await self._resolve_tool_context(stream_id=stream_id, **kwargs)
+        if not context.stream_id:
+            return {"success": False, "message": "缺少 stream_id，无法确定当前聊天流"}
+        if not context.group_id:
+            return {"success": False, "message": "主动沉默工具只能在群聊聊天流中使用"}
+
+        seconds = self._coerce_tool_duration(duration_seconds)
+        was_muted = self._mute_status.is_muted(context.group_id)
+        self._mute_status.set_mute(
+            context.group_id,
+            seconds,
+            context.group_name or None,
+            stream_id=context.stream_id,
+        )
+
+        logger.info(
+            "[%s] 麦麦通过 %s 工具主动进入沉默，持续 %s 秒。reason=%s",
+            context.group_name or context.group_id,
+            tool_name,
+            seconds,
+            (reason or "").strip() or "<empty>",
+        )
+        return {
+            "success": True,
+            "message": "已进入沉默状态" if not was_muted else "已续期沉默状态",
+            "stream_id": context.stream_id,
+            "group_id": context.group_id,
+            "duration_seconds": seconds,
+            "remaining_seconds": self._mute_status.remaining_seconds(context.group_id),
+        }
+
+    def _coerce_tool_duration(self, duration_seconds: Optional[int]) -> int:
+        """将工具传入时长收敛到配置允许范围。"""
+        default_seconds = int(self.config.tool.default_duration_seconds)
+        max_seconds = int(self.config.tool.max_duration_seconds)
+        if duration_seconds in (None, ""):
+            seconds = default_seconds
+        else:
+            try:
+                seconds = int(duration_seconds)
+            except (TypeError, ValueError):
+                seconds = default_seconds
+        seconds = min(max(seconds, _MUTE_DURATION_MIN_SECONDS), max_seconds)
+        return min(seconds, _MUTE_DURATION_MAX_SECONDS)
+
+    async def _resolve_tool_context(self, stream_id: str, **kwargs: Any) -> MessageContext:
+        """从工具上下文与 Chat 能力中解析群聊上下文。"""
+        sid = str(stream_id or kwargs.get("stream_id") or kwargs.get("session_id") or "")
+        group_id = str(kwargs.get("group_id") or "")
+        group_name = str(kwargs.get("group_name") or "")
+
+        if not group_id:
+            group_id = self._mute_status.group_for_stream(sid)
+
+        if sid and not group_id:
+            try:
+                streams = await self.ctx.chat.get_group_streams()
+            except Exception:
+                logger.warning("[mute_guard] 查询群聊流失败，无法解析主动沉默目标", exc_info=True)
+                streams = []
+            for stream in streams or []:
+                if not isinstance(stream, dict):
+                    continue
+                stream_sid = str(stream.get("session_id") or stream.get("stream_id") or "")
+                if stream_sid != sid:
+                    continue
+                group_info = stream.get("group_info") or {}
+                group_id = str(
+                    stream.get("group_id")
+                    or group_info.get("group_id")
+                    or stream.get("target_id")
+                    or ""
+                )
+                group_name = str(
+                    stream.get("group_name")
+                    or group_info.get("group_name")
+                    or stream.get("name")
+                    or group_name
+                    or ""
+                )
+                break
+
+        return MessageContext(stream_id=sid, group_id=group_id, group_name=group_name)
 
     def _should_send_refusal(self, group_id: str) -> bool:
         """拒绝回复的同群节流：冷却期内返回 False，否则记录时间戳并放行。"""
