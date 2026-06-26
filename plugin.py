@@ -366,7 +366,8 @@ class MuteSessionTracker:
         * 后台摘要任务（周期性输出仍静音群的剩余时间）
         * 每群消息驱动日志的节流时间戳
 
-    热重载 → 状态丢失是接受的行为，见 docs/adr/0001-mute-tracker-no-persistence.md。
+    热重载 / 重启 → 内存态静音会话全部丢失是**有意接受**的行为：静音是临时管控，
+    重新发关键词即可恢复，不值得为它引入持久化存储与跨重启的一致性复杂度。
     """
 
     def __init__(
@@ -406,9 +407,18 @@ class MuteSessionTracker:
 
         已知边界：排在本插件前面的 hook 若改写了消息文本，比对会失配 →
         控制消息被拦（fail-closed，与无令牌时的失败模式相同），令牌留到过期。
+
+        ``expected_text`` 去除首尾空白后为空时直接跳过、不入令牌：用户把
+        mute_reply / renew_reply 配成空串时会存出一个空键令牌，而纯图片 /
+        表情等出站消息的 processed_plain_text 同样是空串，consume_exempt 会
+        误命中空令牌、把本该拦下的消息放行。与 _drop_blank_keywords 同源的
+        防空串对称防御。
         """
+        key = expected_text.strip()
+        if not key:
+            return
         tokens = self._send_exempt.setdefault(group_id, {})
-        tokens[expected_text.strip()] = time.time() + seconds
+        tokens[key] = time.time() + seconds
 
     def consume_exempt(self, group_id: str, outbound_text: str) -> bool:
         """检查并**消耗**豁免令牌。
@@ -555,8 +565,9 @@ class MuteSessionTracker:
         except asyncio.CancelledError:
             pass
         except Exception:
-            # 任务死亡不影响核心功能（is_muted 惰性过期兜底），但不记日志
-            # 异常会埋到 GC 时才以 "exception was never retrieved" 浮出
+            # 任务死亡不影响核心功能（is_muted 惰性过期兜底），但必须主动记录：
+            # 否则异常会被 Task 静默吞掉、直到 GC 时才以 "exception was never retrieved"
+            # 浮出，难以定位。下次 set_mute 会自动重建本任务。
             logger.exception("摘要日志任务异常退出，下次 set_mute 时自动重建")
 
     async def cancel_summary_task(self) -> None:
@@ -644,9 +655,9 @@ class MessageContext:
     ``is_bot_mentioned`` 依赖 adapter 在入站时正确设置 ``is_at`` / ``is_mentioned``，
     语义为"@ 到 bot 自己"。napcat adapter 已实现该契约（仅当
     target_user_id == self_id 时设 True）；其它 adapter 若未实现，本插件的
-    @ 解除静音功能会降级——但关键词解除仍可用。历史上的 segments / raw_content
-    fallback 把"@任何人"误判为"@ bot"，已删除，
-    详见 docs/adr/0002-trust-adapter-is-at-fields.md。
+    @ 解除静音功能会降级——但关键词解除仍可用。历史上曾用 segments / raw_content
+    fallback 兜底，但纯文本层无法区分"@bot"与"@任何人"，会把"@任何人"误判成
+    "@ bot"，故已删除：宁可信任 adapter 的 ``is_at`` / ``is_mentioned``，也不引入不可靠兜底。
     """
 
     plain_text: str = ""
@@ -875,8 +886,10 @@ class GroupMuterPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._admin_roster = AdminRoster()  # 权限判定缓存，on_load / on_config_update 时 refresh
-        # 后台控制消息发送任务的强引用：create_task 后不存引用会被 GC 提前回收
-        self._send_tasks: set[asyncio.Task] = set()
+        # 后台 fire-and-forget 任务的强引用（控制消息发送 + 静音过期后的频率恢复）：
+        # create_task 后不存引用会被 GC 提前回收；on_unload 统一 cancel 并 await。
+        # 与 _peek_tasks 分开是因为后者在 on_unload 里需先于频率恢复被取消（有时序耦合）。
+        self._background_tasks: set[asyncio.Task] = set()
         # 静音指令触发后的后台窥屏任务：避免入站 Hook 等频率 RPC 导致 abort 超时丢失
         self._peek_tasks: set[asyncio.Task] = set()
         # 实例字段而非类变量：避免热重载时旧实例 on_unload 抹掉新实例状态
@@ -922,11 +935,11 @@ class GroupMuterPlugin(MaiBotPlugin):
             await asyncio.gather(*self._peek_tasks, return_exceptions=True)
         self._peek_tasks.clear()
         await self._restore_all_frequency_adjustments()
-        for task in list(self._send_tasks):
+        for task in list(self._background_tasks):
             task.cancel()
-        if self._send_tasks:
-            await asyncio.gather(*self._send_tasks, return_exceptions=True)
-        self._send_tasks.clear()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         """配置热重载回调。"""
@@ -952,7 +965,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="duration_seconds",
                 param_type=ToolParamType.INTEGER,
-                description="沉默时长（秒），可选；不填使用插件默认值，过大会按配置上限收敛。",
+                description="沉默时长（秒），可选；不填使用插件默认值，过小（小于 60 秒）按下限 60、过大按配置上限收敛。",
                 required=False,
                 default=None,
             ),
@@ -1195,7 +1208,17 @@ class GroupMuterPlugin(MaiBotPlugin):
             context.group_name or None,
             stream_id=context.stream_id,
         )
-        await self._enter_peek_mode(context.stream_id, context.group_id)
+        # 与入站守卫一致：仅在开启窥屏时尝试；失败只 warning 不回滚静音状态——
+        # set_mute 已生效，后续 intercept 消息会重试进入窥屏（自愈），漏网回复由出站守卫兜底。
+        if self.config.mute.learn_while_muted and not await self._enter_peek_mode(
+            context.stream_id, context.group_id
+        ):
+            logger.warning(
+                "[mute_guard] silence 工具设置静音后进入纯窥屏失败，"
+                "后续静音消息将退回入站拦截 (stream=%s, group=%s)",
+                context.stream_id,
+                context.group_id,
+            )
 
         logger.info(
             "[%s] 麦麦通过 %s 工具主动进入沉默，持续 %s 秒。reason=%s",
@@ -1440,8 +1463,8 @@ class GroupMuterPlugin(MaiBotPlugin):
         if not stream_id:
             return
         task = asyncio.create_task(self._restore_frequency_adjustment(stream_id))
-        self._send_tasks.add(task)
-        task.add_done_callback(self._send_tasks.discard)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def _should_send_refusal(self, group_id: str) -> bool:
         """拒绝回复的同群节流：冷却期内返回 False，否则记录时间戳并放行。"""
@@ -1454,14 +1477,14 @@ class GroupMuterPlugin(MaiBotPlugin):
     def _spawn_control_send(self, text: str, stream_id: str, *, label: str) -> None:
         """后台发送控制消息，与入站 hook 的决策返回解耦。
 
-        任务引用存入 ``_send_tasks`` 防 GC，完成后自动移除；
+        任务引用存入 ``_background_tasks`` 防 GC，完成后自动移除；
         on_unload 统一取消未完成的任务。
         """
         task = asyncio.create_task(
             self._send_control_message(text, stream_id, label=label)
         )
-        self._send_tasks.add(task)
-        task.add_done_callback(self._send_tasks.discard)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _send_control_message(self, text: str, stream_id: str, *, label: str) -> None:
         """实际执行控制消息发送，并检查结果。
