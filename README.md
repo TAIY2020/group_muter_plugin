@@ -111,6 +111,24 @@
 - 静音状态仅保存在内存中，插件热重载或主程序重启后所有静音会自动解除，管理员重新发送关键词即可。若启用了纯窥屏模式，插件卸载时会尽量恢复已记录的发言频率调整值。
 - 极少数情况下，如果插件 Runner 单独崩溃而 MaiBot 主程序仍保持运行，Host 内存中的发言频率调整值可能停留在 `0`。如发现某群在插件异常后长期不主动发言，可重启主程序或手动重置该聊天流的发言频率。
 
+### 🤖 LLM 动态回复
+
+插件支持使用 LLM 动态生成回复文案，替代固定的 `mute_reply` / `renew_reply` / `unmute_reply` / `no_permission_reply`。
+
+#### 启用方法
+
+1. 将 `mute.llm_reply_enabled` 设为 `true`。
+2. 可选：将 `mute.llm_reply_use_context` 设为 `true`，让 LLM 在生成回复时参考最近 10 条群聊消息。
+
+#### 行为说明
+
+- **启用后**：开启静音、续期、解除、拒绝权限、主动沉默（`silence` 工具）均使用 LLM 生成动态文案。
+- **关闭时**：完全沿用现有固定回复，不调用 LLM 或消息历史接口。
+- **提示词模板**：默认模板包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）、`{context}`（最近消息，需开启上下文）三个占位符，可通过 `mute.llm_reply_prompt` 自定义。
+- **超时与 fallback**：LLM 生成超时（30 秒）、异常或返回空文本时自动回退到对应的固定回复。
+- **上下文**：开启上下文时读取最近 10 条群聊消息，提取昵称与纯文本作为辅助；读取失败不阻断生成，仍以无上下文方式继续。
+- **主动沉默工具**：`silence` 工具返回的 `message` 字段也会使用 LLM 生成；失败时回退默认提示 `已进入沉默状态` / `已续期沉默状态`，不额外向群发送消息。
+
 ### 配置项说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
@@ -125,6 +143,9 @@
 | `mute.unmute_reply` | str | `我回来啦，你们聊啥呢🤔` | 解除静音时麦麦的回复语（@解除与关键词解除共用） |
 | `mute.no_permission_reply` | str | `？？？你在教我做事🤡` | 非管理员尝试触发静音时的拒绝回复 |
 | `mute.learn_while_muted` | bool | `true` | 静音期间是否把当前聊天流发言频率调整为 `0`，让麦麦继续读取群聊上下文 |
+| `mute.llm_reply_enabled` | bool | `false` | 是否使用 LLM 动态生成回复文案（关闭时使用各固定回复字段） |
+| `mute.llm_reply_prompt` | str | `根据以下事件和群聊语气...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` 占位符 |
+| `mute.llm_reply_use_context` | bool | `false` | LLM 生成回复时是否读取最近 10 条群聊消息作为上下文 |
 | `user_control.list_type` | str | `whitelist` | 权限模式：`whitelist` 仅名单内可操作；`blacklist` 名单外可操作（空名单 = 全员可操作） |
 | `user_control.list` | list | `[]` | 拥有静音操作权限的 QQ 号列表（字符串，如 `["123456"]`） |
 | `tool.enabled` | bool | `true` | 是否允许麦麦通过 `silence` 工具主动进入沉默 |
