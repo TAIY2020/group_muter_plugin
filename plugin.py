@@ -76,13 +76,16 @@ _LLM_EVENT_LABELS = {
     "renew_mute": "管理员续期了你在群聊中的静音",
     "end_mute": "管理员解除了你在群聊中静音",
     "refuse_start": "非管理员试图让你静音但被拒绝",
-    "silence_start": "你主动进入了沉默状态",
-    "silence_renew": "你主动续期了沉默状态",
 }
 
 _LLM_GENERATE_TIMEOUT = 30
-_LLM_MAX_TOKENS = 2048
+# 一两句话的短回复绰绰有余；模型不听话输出长文时靠它硬截断，
+# 而非把 2048 token 的多行长文原样发进群
+_LLM_MAX_TOKENS = 200
 _LLM_CONTEXT_LIMIT = 10
+# LLM 回复的字符数上限（_sanitize_llm_reply 兜底截断）：
+# 输出直接进群，且出站豁免令牌按文本精确匹配——越短越稳
+_LLM_REPLY_MAX_CHARS = 100
 
 
 # --- 配置模型 ---
@@ -641,6 +644,31 @@ class MuteSessionTracker:
 def _strip_at_prefix(text: str) -> str:
     """去除文本中的 CQ at 码和 @前缀。"""
     return _AT_PREFIX_PATTERN.sub("", text).strip()
+
+
+# 模型"不听话"时常见的包裹引号对：左引号 → 对应右引号
+_LLM_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
+
+
+def _sanitize_llm_reply(raw: str) -> str:
+    """LLM 回复的输出兜底清理：剥包裹引号、压成单行、超长截断。
+
+    提示词已要求"只输出回复正文"，这里是模型不听话时的硬约束——
+    输出会原样发进群，且出站豁免令牌按文本精确匹配，输出越短越怪
+    翻车面越大。多行时只取第一个非空行（后续行多为解释或备选项），
+    清理后为空串由调用方回退固定回复。
+    """
+    text = raw.strip()
+    if len(text) >= 2 and text[0] in _LLM_QUOTE_PAIRS and text.endswith(_LLM_QUOTE_PAIRS[text[0]]):
+        text = text[1:-1].strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            text = line
+            break
+    else:
+        return ""
+    return text[:_LLM_REPLY_MAX_CHARS]
 
 
 def _is_keyword_in_text(
@@ -1282,18 +1310,12 @@ class GroupMuterPlugin(MaiBotPlugin):
             seconds,
             (reason or "").strip() or "<empty>",
         )
-        fallback_msg = "已进入沉默状态" if not was_muted else "已续期沉默状态"
-        if self.config.mute.llm_reply_enabled:
-            llm_reply = await self._generate_llm_reply(
-                event="silence_start" if not was_muted else "silence_renew",
-                fallback=fallback_msg,
-                stream_id=context.stream_id,
-            )
-            if llm_reply:
-                fallback_msg = llm_reply
+        # 工具的 message 只是回给上层 LLM 的工具结果，不是发到群里的消息——
+        # 此刻群已静音，上层模型即使转述也会被出站守卫拦下。曾在此处内联
+        # LLM 生成动态文案，最多拖慢工具 30 秒去产出一条没人看见的话，已删除。
         return {
             "success": True,
-            "message": fallback_msg,
+            "message": "已进入沉默状态" if not was_muted else "已续期沉默状态",
             "stream_id": context.stream_id,
             "group_id": context.group_id,
             "duration_seconds": seconds,
@@ -1588,7 +1610,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             logger.warning("[llm_reply] %s LLM 返回 success=false，回退固定回复", event)
             return None
         raw = result.get("response") or ""
-        text = raw.strip()
+        text = _sanitize_llm_reply(str(raw))
         if not text:
             logger.warning("[llm_reply] %s LLM 返回空文本，回退固定回复", event)
             return None
@@ -1601,7 +1623,7 @@ class GroupMuterPlugin(MaiBotPlugin):
         读取失败返回空串，不阻断后续生成流程。
         """
         try:
-            messages = await self.ctx.message.get_recent(
+            result = await self.ctx.message.get_recent(
                 chat_id=stream_id,
                 limit=_LLM_CONTEXT_LIMIT,
             )
@@ -1610,14 +1632,27 @@ class GroupMuterPlugin(MaiBotPlugin):
                 "[llm_reply] 读取最近消息失败，跳过上下文", exc_info=True,
             )
             return ""
+        # Host 能力返回 {"success": bool, "messages": [...]} 信封；容忍未来直接给裸列表
+        if isinstance(result, dict):
+            if not result.get("success"):
+                logger.warning(
+                    "[llm_reply] message.get_recent 返回 success=false，跳过上下文 (error=%s)",
+                    result.get("error"),
+                )
+                return ""
+            messages = result.get("messages")
+        else:
+            messages = result
         if not messages or not isinstance(messages, list):
             return ""
         lines = []
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            user_info = msg.get("user_info") or {}
-            nickname = str(user_info.get("nickname") or "")
+            # user_info 嵌套在 message_info 下（与 MessageContext.from_message 同一序列化形态）；
+            # 群聊显示名优先群名片 user_cardname，缺失时回退 user_nickname
+            user_info = (msg.get("message_info") or {}).get("user_info") or {}
+            nickname = str(user_info.get("user_cardname") or user_info.get("user_nickname") or "")
             text = str(msg.get("processed_plain_text") or "").strip()
             if not text:
                 continue
