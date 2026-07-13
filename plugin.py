@@ -67,6 +67,23 @@ _TOOL_MUTE_MAX_DEFAULT_SECONDS = 10800
 # 纯窥屏回读校验的浮点容差：set_adjust(0) 后回读 get_adjust，> 此值视为未归零（假成功）
 _PEEK_FREQUENCY_EPSILON = 1e-6
 
+# LLM 动态回复
+
+_LLM_DEFAULT_REPLY_PROMPT = "根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n事件：{event}\n固定回复参考：{fallback}\n{context}"
+
+_LLM_EVENT_LABELS = {
+    "start_mute": "管理员要求你在群聊中静音",
+    "renew_mute": "管理员续期了你在群聊中的静音",
+    "end_mute": "管理员解除了你在群聊中静音",
+    "refuse_start": "非管理员试图让你静音但被拒绝",
+    "silence_start": "你主动进入了沉默状态",
+    "silence_renew": "你主动续期了沉默状态",
+}
+
+_LLM_GENERATE_TIMEOUT = 30
+_LLM_MAX_TOKENS = 2048
+_LLM_CONTEXT_LIMIT = 10
+
 
 # --- 配置模型 ---
 
@@ -158,6 +175,21 @@ class MuteSection(PluginConfigBase):
             "label": "静音时窥屏",
             "hint": "启用后静音期间普通群消息不再被入站吞掉，而是交给上游以发言频率 0 的纯窥屏模式处理。",
         },
+    )
+    llm_reply_enabled: bool = Field(
+        default=False,
+        description="是否使用 LLM 动态生成回复文案（默认关闭，关闭时使用固定回复）",
+        json_schema_extra={"label": "LLM 动态回复"},
+    )
+    llm_reply_prompt: str = Field(
+        default=_LLM_DEFAULT_REPLY_PROMPT,
+        description="LLM 生成回复的提示词模板，支持 {event} {fallback} {context} 占位符",
+        json_schema_extra={"label": "LLM 提示词模板"},
+    )
+    llm_reply_use_context: bool = Field(
+        default=False,
+        description="LLM 生成回复时是否读取最近 10 条群聊消息作为上下文",
+        json_schema_extra={"label": "LLM 读取群聊上下文"},
     )
 
     @field_validator("mute_keywords", "unmute_keywords", mode="before")
@@ -1080,7 +1112,7 @@ class GroupMuterPlugin(MaiBotPlugin):
     async def _dispatch_intent(self, intent: MuteIntent) -> Optional[Dict[str, Any]]:
         """根据 intent 执行副作用（修改 mute 状态 + 发回复 + 日志）。
 
-        回复一律 ``_spawn_control_send`` 后台发送、本方法立即返回 abort：
+        回复一律后台发送、本方法立即返回 abort：
         宿主端 send.text 会同步等完整发送管线（after_build_message /
         before_send 全部 BLOCKING hook + 平台 IO 投递），若在此 await，
         全程计入入站 hook 的 timeout_ms 预算；一旦超时，ErrorPolicy.SKIP
@@ -1111,18 +1143,35 @@ class GroupMuterPlugin(MaiBotPlugin):
                 intent.group_id,
                 label=intent.kind,
             )
-            self._mute_status.set_send_exempt(intent.group_id, reply)
-            self._spawn_control_send(reply, intent.stream_id, label=intent.kind)
+            if self.config.mute.llm_reply_enabled:
+                self._spawn_llm_control_send(
+                    event=intent.kind,
+                    fallback=reply,
+                    stream_id=intent.stream_id,
+                    label=intent.kind,
+                    group_id=intent.group_id,
+                )
+            else:
+                self._mute_status.set_send_exempt(intent.group_id, reply)
+                self._spawn_control_send(reply, intent.stream_id, label=intent.kind)
             return {"action": "abort"}
 
         if intent.kind == "refuse_start":
             # 拒绝回复做同群节流防刷屏；拦截本身不节流
             if self._should_send_refusal(intent.group_id):
-                self._spawn_control_send(
-                    self.config.mute.no_permission_reply,
-                    intent.stream_id,
-                    label="refuse_start",
-                )
+                if self.config.mute.llm_reply_enabled:
+                    self._spawn_llm_control_send(
+                        event="refuse_start",
+                        fallback=self.config.mute.no_permission_reply,
+                        stream_id=intent.stream_id,
+                        label="refuse_start",
+                    )
+                else:
+                    self._spawn_control_send(
+                        self.config.mute.no_permission_reply,
+                        intent.stream_id,
+                        label="refuse_start",
+                    )
             return {"action": "abort"}
 
         if intent.kind == "end_mute":
@@ -1130,11 +1179,17 @@ class GroupMuterPlugin(MaiBotPlugin):
             self._mute_status.clear_mute(intent.group_id)
             self._refuse_reply_last.pop(intent.group_id, None)
             await self._restore_frequency_adjustment(stream_id)
-            # 用 fallback 后的 stream_id 发送：入站消息缺 session_id 而 tracker 有缓存时，
-            # 沿用原始 intent.stream_id（空）会让频率恢复成功、解除回复却发不出。
-            self._spawn_control_send(
-                self.config.mute.unmute_reply, stream_id, label="end_mute",
-            )
+            if self.config.mute.llm_reply_enabled:
+                self._spawn_llm_control_send(
+                    event="end_mute",
+                    fallback=self.config.mute.unmute_reply,
+                    stream_id=stream_id,
+                    label="end_mute",
+                )
+            else:
+                self._spawn_control_send(
+                    self.config.mute.unmute_reply, stream_id, label="end_mute",
+                )
             return {"action": "abort"}
 
         if intent.kind == "intercept_while_muted":
@@ -1227,9 +1282,18 @@ class GroupMuterPlugin(MaiBotPlugin):
             seconds,
             (reason or "").strip() or "<empty>",
         )
+        fallback_msg = "已进入沉默状态" if not was_muted else "已续期沉默状态"
+        if self.config.mute.llm_reply_enabled:
+            llm_reply = await self._generate_llm_reply(
+                event="silence_start" if not was_muted else "silence_renew",
+                fallback=fallback_msg,
+                stream_id=context.stream_id,
+            )
+            if llm_reply:
+                fallback_msg = llm_reply
         return {
             "success": True,
-            "message": "已进入沉默状态" if not was_muted else "已续期沉默状态",
+            "message": fallback_msg,
             "stream_id": context.stream_id,
             "group_id": context.group_id,
             "duration_seconds": seconds,
@@ -1473,6 +1537,125 @@ class GroupMuterPlugin(MaiBotPlugin):
             return False
         self._refuse_reply_last[group_id] = now
         return True
+
+    # ===== LLM 动态回复 =====
+
+    async def _generate_llm_reply(
+        self,
+        event: str,
+        fallback: str,
+        stream_id: str,
+    ) -> Optional[str]:
+        """调用 LLM 生成动态回复；失败或关闭时返回 None。
+
+        仅当 ``llm_reply_enabled`` 为 True 时才会调用 LLM。
+        ``event`` 对应的中文说明见 ``_LLM_EVENT_LABELS``。
+        """
+        if not self.config.mute.llm_reply_enabled:
+            return None
+        prompt = self.config.mute.llm_reply_prompt
+        event_label = _LLM_EVENT_LABELS.get(event, event)
+        context_text = ""
+        if self.config.mute.llm_reply_use_context and stream_id:
+            context_text = await self._fetch_recent_context(stream_id)
+        rendered = (
+            prompt
+            .replace("{event}", event_label)
+            .replace("{fallback}", fallback)
+            .replace("{context}", context_text)
+        )
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.llm.generate(prompt=rendered, model="replyer", max_tokens=_LLM_MAX_TOKENS),
+                timeout=_LLM_GENERATE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[llm_reply] %s LLM 生成超时（%s 秒），回退固定回复", event, _LLM_GENERATE_TIMEOUT,
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[llm_reply] %s LLM 生成异常，回退固定回复", event, exc_info=True,
+            )
+            return None
+        if not isinstance(result, dict):
+            logger.warning("[llm_reply] %s LLM 返回非 dict (%r)，回退固定回复", event, type(result).__name__)
+            return None
+        if not result.get("success"):
+            logger.warning("[llm_reply] %s LLM 返回 success=false，回退固定回复", event)
+            return None
+        raw = result.get("response") or ""
+        text = raw.strip()
+        if not text:
+            logger.warning("[llm_reply] %s LLM 返回空文本，回退固定回复", event)
+            return None
+        logger.info("[llm_reply] %s LLM 生成回复: %s", event, text)
+        return text
+
+    async def _fetch_recent_context(self, stream_id: str) -> str:
+        """读取当前群聊最近 ``_LLM_CONTEXT_LIMIT`` 条纯文本消息作为 LLM 上下文。
+
+        读取失败返回空串，不阻断后续生成流程。
+        """
+        try:
+            messages = await self.ctx.message.get_recent(
+                chat_id=stream_id,
+                limit=_LLM_CONTEXT_LIMIT,
+            )
+        except Exception:
+            logger.warning(
+                "[llm_reply] 读取最近消息失败，跳过上下文", exc_info=True,
+            )
+            return ""
+        if not messages or not isinstance(messages, list):
+            return ""
+        lines = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            user_info = msg.get("user_info") or {}
+            nickname = str(user_info.get("nickname") or "")
+            text = str(msg.get("processed_plain_text") or "").strip()
+            if not text:
+                continue
+            lines.append(f"{nickname}: {text}" if nickname else text)
+        if lines:
+            return "最近群聊消息：\n" + "\n".join(lines)
+        return ""
+
+    def _spawn_llm_control_send(
+        self,
+        event: str,
+        fallback: str,
+        stream_id: str,
+        *,
+        label: str,
+        group_id: str = "",
+    ) -> None:
+        """后台生成 LLM 动态回复并发送控制消息。"""
+        task = asyncio.create_task(
+            self._llm_send_control_message(event, fallback, stream_id, label=label, group_id=group_id),
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _llm_send_control_message(
+        self,
+        event: str,
+        fallback: str,
+        stream_id: str,
+        *,
+        label: str,
+        group_id: str = "",
+    ) -> None:
+        """LLM 生成 + 出站豁免 + 发送，在后台任务中完成。"""
+        reply = (await self._generate_llm_reply(event, fallback, stream_id)) or fallback
+        if group_id and label in ("start_mute", "renew_mute"):
+            self._mute_status.set_send_exempt(group_id, reply)
+        await self._send_control_message(reply, stream_id, label=label)
 
     def _spawn_control_send(self, text: str, stream_id: str, *, label: str) -> None:
         """后台发送控制消息，与入站 hook 的决策返回解耦。

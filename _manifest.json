@@ -27,7 +27,9 @@
     "send.text",
     "frequency.get_adjust",
     "frequency.set_adjust",
-    "chat.get_group_streams"
+    "chat.get_group_streams",
+    "llm.generate",
+    "message.get_recent"
   ],
   "i18n": {
     "default_locale": "zh-CN",
