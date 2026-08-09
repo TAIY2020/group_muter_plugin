@@ -20,9 +20,11 @@ from pydantic import field_validator, model_validator
 
 import asyncio
 import logging
+import os
 import re
 import time
 import json
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dataclasses import dataclass
@@ -49,7 +51,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "2.2.1"
+CONFIG_SCHEMA_VERSION = "2.3.0"
 
 # 预编译正则：匹配 CQ at 码或 @前缀
 _AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
@@ -177,6 +179,14 @@ class MuteSection(PluginConfigBase):
         json_schema_extra={
             "label": "静音时窥屏",
             "hint": "启用后静音期间普通群消息不再被入站吞掉，而是交给上游以发言频率 0 的纯窥屏模式处理。",
+        },
+    )
+    persist_sessions: bool = Field(
+        default=True,
+        description="静音状态是否持久化到磁盘（重启/重载后恢复未到期的静音）",
+        json_schema_extra={
+            "label": "静音状态持久化",
+            "hint": "关闭则保持旧行为：重启后静音状态丢失，需重新发送关键词。",
         },
     )
     llm_reply_enabled: bool = Field(
@@ -401,13 +411,16 @@ class MuteSessionTracker:
         * 后台摘要任务（周期性输出仍静音群的剩余时间）
         * 每群消息驱动日志的节流时间戳
 
-    热重载 / 重启 → 内存态静音会话全部丢失是**有意接受**的行为：静音是临时管控，
-    重新发关键词即可恢复，不值得为它引入持久化存储与跨重启的一致性复杂度。
+    热重载 / 重启后的会话恢复由插件层负责：tracker 本身仍是纯内存状态，仅在
+    会话增删时经 ``_on_change`` 通知插件写盘（persist_sessions=true 时），
+    加载时由插件读盘重新注入未到期的会话；关闭持久化则保持旧行为（重启即丢，
+    重新发关键词恢复）。
     """
 
     def __init__(
         self,
         on_expire: Optional[Callable[[str, str], None]] = None,
+        on_change: Optional[Callable[[], None]] = None,
     ) -> None:
         self._mute_until: Dict[str, float] = {}
         self._group_names: Dict[str, str] = {}
@@ -416,6 +429,28 @@ class MuteSessionTracker:
         self._summary_task: Optional[asyncio.Task] = None  # 后台摘要日志定时任务
         self._last_msg_log_time: Dict[str, float] = {}  # 消息驱动日志的节流时间戳
         self._on_expire = on_expire
+        # 静音会话集合增删时的回调（set_mute / clear_mute 触发），供插件把会话
+        # 快照写盘持久化；回调须自吞异常且不得阻塞（当前实现为调度后台写盘任务）。
+        self._on_change = on_change
+
+    def export_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """导出当前静音会话快照（持久化用）：group_id → {expire_at, group_name, stream_id}。"""
+        return {
+            group_id: {
+                "expire_at": expire_at,
+                "group_name": self._group_names.get(group_id, ""),
+                "stream_id": self._stream_ids.get(group_id, ""),
+            }
+            for group_id, expire_at in self._mute_until.items()
+        }
+
+    def _notify_change(self) -> None:
+        """会话集合变更后通知持久化回调（回调侧自吞异常，这里再兜一层防御）。"""
+        if self._on_change:
+            try:
+                self._on_change()
+            except Exception:
+                logger.exception("静音会话变更回调异常")
 
     def display_name(self, group_id: str) -> str:
         """返回日志显示用的群名；缺失时回退为 group_id。"""
@@ -496,6 +531,7 @@ class MuteSessionTracker:
         logger.info(f"[{group_name or group_id}] 进入静音模式，持续 {seconds} 秒。")
         # 确保后台摘要日志任务正在运行
         self._ensure_summary_task()
+        self._notify_change()
 
     def clear_mute(self, group_id: str, *, expired: bool = False) -> None:
         """终结指定群的静音会话——**唯一的会话终结实现**。
@@ -516,6 +552,7 @@ class MuteSessionTracker:
                     self._on_expire(group_id, stream_id)
             else:
                 logger.info(f"[{display_name}] 已解除静音模式。")
+            self._notify_change()
 
     def is_muted(self, group_id: str) -> bool:
         """检查指定群是否处于静音状态，超时则自动解除。"""
@@ -953,7 +990,12 @@ class GroupMuterPlugin(MaiBotPlugin):
         # 静音指令触发后的后台窥屏任务：避免入站 Hook 等频率 RPC 导致 abort 超时丢失
         self._peek_tasks: set[asyncio.Task] = set()
         # 实例字段而非类变量：避免热重载时旧实例 on_unload 抹掉新实例状态
-        self._mute_status = MuteSessionTracker(self._schedule_expired_frequency_restore)
+        self._mute_status = MuteSessionTracker(
+            self._schedule_expired_frequency_restore,
+            self._schedule_session_save,
+        )
+        # 静音会话持久化文件路径（on_load 解析 ctx.paths.data_dir 后填充；空串=不持久化）
+        self._session_file: str = ""
         # refuse_start 拒绝回复的同群节流时间戳
         self._refuse_reply_last: Dict[str, float] = {}
         # learn_while_muted 会把发言频率调整为 0，解除/卸载时需要恢复原值
@@ -972,7 +1014,96 @@ class GroupMuterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._admin_roster.refresh(self.config.user_control)
+        if self.config.mute.persist_sessions:
+            self._init_session_persistence()
         logger.info("群聊静音插件(v%s)初始化完成。", PLUGIN_VERSION)
+
+    # ===== 静音会话持久化 =====
+
+    def _init_session_persistence(self) -> None:
+        """解析持久化文件路径并恢复未到期的静音会话（on_load 调用）。"""
+        try:
+            data_dir = Path(self.ctx.paths.data_dir)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            self._session_file = str(data_dir / "mute_sessions.json")
+        except Exception as e:
+            logger.warning("获取插件持久数据目录失败: %s；本次运行静音状态不持久化", e)
+            self._session_file = ""
+            return
+        self._restore_persisted_sessions()
+
+    def _restore_persisted_sessions(self) -> None:
+        """读盘恢复未到期的静音会话；过期项丢弃，文件损坏按空处理（不影响主功能）。
+
+        经 tracker.set_mute 注入：日志、摘要任务、on_change 写盘（顺带清掉过期项）
+        与正常入会话完全同路。窥屏频率归零不在此处理——下一条入站消息经
+        _enter_peek_mode 惰性重建（含重新记录 restore 原值），与冷群假成功自愈同路。
+        """
+        path = Path(self._session_file)
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            sessions = raw.get("sessions", {}) if isinstance(raw, dict) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("读取静音会话持久化文件失败: %s；按无会话处理", e)
+            return
+        now = time.time()
+        restored = 0
+        for group_id, entry in sessions.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                remaining = int(float(entry.get("expire_at", 0)) - now)
+            except (TypeError, ValueError):
+                continue
+            if remaining <= 0:
+                continue
+            self._mute_status.set_mute(
+                str(group_id),
+                remaining,
+                group_name=str(entry.get("group_name") or "") or None,
+                stream_id=str(entry.get("stream_id") or "") or None,
+            )
+            restored += 1
+        if restored:
+            logger.info("已从持久化文件恢复 %d 个未到期的静音会话", restored)
+        else:
+            # 全部过期/为空：主动写一次盘清掉陈旧内容
+            self._schedule_session_save()
+
+    def _schedule_session_save(self) -> None:
+        """调度后台任务把当前静音会话快照写盘（tracker 的 on_change 回调，须非阻塞）。
+
+        每次全量覆写快照文件，天然幂等；并发调度多次也只是重复写同一份最新快照，
+        无需去重。事件循环外调用（理论上不会发生）或未启用持久化时静默跳过。
+        """
+        if not self._session_file:
+            return
+        snapshot = {"sessions": self._mute_status.export_sessions()}
+        try:
+            task = asyncio.create_task(asyncio.to_thread(self._write_sessions_sync, snapshot))
+        except RuntimeError:
+            return
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _write_sessions_sync(self, snapshot: Dict[str, Any]) -> None:
+        """原子写入静音会话快照（临时文件 + 原子替换，同步，经 to_thread 调用）。"""
+        path = Path(self._session_file)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(path)
+        except OSError as e:
+            logger.warning("写入静音会话持久化文件失败: %s", e)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def on_unload(self) -> None:
         """插件卸载时取消后台任务。
@@ -1000,6 +1131,16 @@ class GroupMuterPlugin(MaiBotPlugin):
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+        # 收尾写盘：上面 cancel 可能打断在途的会话快照写任务，这里再全量写一次
+        # 保证落盘的是最终状态（会话本身不因卸载而终结，重载后由 on_load 恢复）。
+        if self._session_file:
+            try:
+                await asyncio.to_thread(
+                    self._write_sessions_sync,
+                    {"sessions": self._mute_status.export_sessions()},
+                )
+            except Exception:
+                logger.warning("卸载时写入静音会话快照失败", exc_info=True)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         """配置热重载回调。"""
@@ -1007,6 +1148,19 @@ class GroupMuterPlugin(MaiBotPlugin):
             self._admin_roster.refresh(self.config.user_control)
             if not self.config.mute.learn_while_muted:
                 await self._restore_all_frequency_adjustments()
+            # 持久化开关热切换：关→停写盘（旧文件保留不动）；开→补初始化。
+            # 开启分支不恢复历史会话——文件里躺的是上次关闭前的陈旧快照，此刻
+            # 内存态才是唯一真相，只需开始写盘；恢复仅发生在 on_load。
+            if not self.config.mute.persist_sessions:
+                self._session_file = ""
+            elif not self._session_file:
+                try:
+                    data_dir = Path(self.ctx.paths.data_dir)
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    self._session_file = str(data_dir / "mute_sessions.json")
+                    self._schedule_session_save()
+                except Exception as e:
+                    logger.warning("开启静音持久化失败: %s", e)
 
     @Tool(
         "silence",
