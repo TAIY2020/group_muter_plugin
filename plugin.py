@@ -55,10 +55,15 @@ PLUGIN_VERSION = _load_manifest_version()
 
 CONFIG_SCHEMA_VERSION = "2.4.0"
 
-# 预编译正则：匹配 CQ at 码或 @前缀
-_AT_PREFIX_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]|@\S+")
-# 仅匹配 CQ at 码（用于含空格群名片的兜底匹配）
-_CQ_AT_PATTERN = re.compile(r"\[CQ:at,[^\]]+\]")
+# 预编译正则：剥掉 processed_plain_text 中的 "@名片" 前缀。
+# Host 把 at 段重渲染为 "@群名片"/"@昵称"（SessionMessage.process_at_component），
+# 两个适配器都不产 CQ 码，这里不再匹配 [CQ:at,...]。
+_AT_PREFIX_PATTERN = re.compile(r"@\S+")
+
+# 窥屏确认后的周期复核：runtime 被 Host 重建（清空上下文指令 / LRU 淘汰）后调整值
+# 回到 1.0，插件的 _peek_confirmed 快速路径却不再 set_adjust。摘要循环每轮对已确认
+# 的流回读一次，发现漂移就撤销确认并重新进入窥屏。单次回读 RPC 的超时预算（秒）。
+_PEEK_VERIFY_RPC_TIMEOUT = 5.0
 
 # 非管理员触发静音关键词时，拒绝回复的同群冷却（秒），防刷屏
 _REFUSE_REPLY_COOLDOWN_SECONDS = 30.0
@@ -78,7 +83,7 @@ _LLM_DEFAULT_REPLY_PROMPT = "根据以下事件和群聊语气，生成一条简
 _LLM_EVENT_LABELS = {
     "start_mute": "管理员要求你在群聊中静音",
     "renew_mute": "管理员续期了你在群聊中的静音",
-    "end_mute": "管理员解除了你在群聊中静音",
+    "end_mute": "管理员解除了你在群聊中的静音",
     "refuse_start": "非管理员试图让你静音但被拒绝",
 }
 
@@ -214,7 +219,7 @@ class MuteSection(PluginConfigBase):
     def _drop_blank_keywords(cls, value: Any) -> Any:
         """剔除空白关键词项。
 
-        纯 @ 消息经 ``_strip_at_prefix`` 剥掉 CQ 码 / @前缀后是空串，
+        纯 @ 消息经 ``_strip_at_prefix`` 剥掉 @前缀后是空串，
         关键词列表里混入 ""（WebUI 列表控件误加空项）会让任何纯 @ 消息
         精确匹配命中——管理员纯 @bot 直接开静音、非管理员被吞消息。
         """
@@ -436,6 +441,7 @@ class MuteSessionTracker:
         self,
         on_expire: Optional[Callable[[str, str], None]] = None,
         on_change: Optional[Callable[[], None]] = None,
+        on_tick: Optional[Callable[[List[str]], None]] = None,
     ) -> None:
         self._mute_until: Dict[str, float] = {}
         self._group_names: Dict[str, str] = {}
@@ -447,6 +453,9 @@ class MuteSessionTracker:
         # 静音会话集合增删时的回调（set_mute / clear_mute 触发），供插件把会话
         # 快照写盘持久化；回调须自吞异常且不得阻塞（当前实现为调度后台写盘任务）。
         self._on_change = on_change
+        # 摘要循环每轮结束时的回调，参数为仍在静音中的 group_id 列表；供插件做
+        # 周期性复核（窥屏频率是否仍归零）。同样须自吞异常、不得阻塞。
+        self._on_tick = on_tick
 
     def export_sessions(self) -> Dict[str, Dict[str, Any]]:
         """导出当前静音会话快照（持久化用）：group_id → {expire_at, group_name, stream_id}。"""
@@ -649,6 +658,12 @@ class MuteSessionTracker:
                             f"将在 {end_str} 结束。"
                         )
 
+                if active_groups and self._on_tick:
+                    try:
+                        self._on_tick(list(active_groups))
+                    except Exception:
+                        logger.exception("摘要循环 on_tick 回调异常")
+
                 # 没有任何群在静音中，退出循环
                 if not self._mute_until:
                     logger.debug("所有群已解除静音，摘要日志任务退出。")
@@ -698,7 +713,7 @@ class MuteSessionTracker:
 # --- 辅助函数 ---
 
 def _strip_at_prefix(text: str) -> str:
-    """去除文本中的 CQ at 码和 @前缀。"""
+    """去除文本中的 "@名片" 前缀。"""
     return _AT_PREFIX_PATTERN.sub("", text).strip()
 
 
@@ -733,9 +748,9 @@ def _is_keyword_in_text(
     *,
     allow_at_suffix_match: bool = False,
 ) -> bool:
-    """检查文本（去除 CQ 码 / @前缀后）是否匹配关键词列表中的某个词。
+    """检查文本（去除 @前缀后）是否匹配关键词列表中的某个词。
 
-    主路径是剥掉 ``[CQ:at,...]`` 与 ``@\\S+`` 后精确匹配；剥后为空串
+    主路径是剥掉 ``@\\S+`` 后精确匹配；剥后为空串
     （纯 @ 消息）不参与匹配——配置层 ``_drop_blank_keywords`` 已剔除空
     关键词，这里是对称防御。
 
@@ -755,9 +770,9 @@ def _is_keyword_in_text(
         return True
     if not allow_at_suffix_match:
         return False
-    no_cq = _CQ_AT_PATTERN.sub("", text).strip()
-    if no_cq.startswith("@"):
-        return any(no_cq.endswith(keyword) for keyword in keywords if keyword)
+    normalized = text.strip()
+    if normalized.startswith("@"):
+        return any(normalized.endswith(keyword) for keyword in keywords if keyword)
     return False
 
 
@@ -790,7 +805,7 @@ class MessageContext:
         if not message or not isinstance(message, dict):
             return cls()
 
-        # processed_plain_text 用于关键词匹配（已去除 CQ 码）；
+        # processed_plain_text 用于关键词匹配（Host 已把 at 段渲染为 "@名片"）；
         # Host 序列化层只输出 processed_plain_text 这一个纯文本键
         plain_text = message.get("processed_plain_text") or ""
 
@@ -913,12 +928,20 @@ class AdminRoster:
         * NapCat 适配器：``get_group_member_info`` 只返回 OneBot 响应的 ``data``
           字典（成员信息本体），查询失败返回 ``None``；
         * SnowLuma 适配器：返回完整 OneBot 响应 ``{"status", "retcode", "data": {...}}``，
-          失败时不抛异常而是 ``status != "ok"``，此时 ``data`` 无 ``role``。
+          失败时不抛异常而是 ``status != "ok"`` / ``retcode`` 非 0，此时 ``data`` 通常为
+          ``None``。这里显式按 ``status`` / ``retcode`` 判失败，不依赖"顶层恰好没有 role"
+          这一兜底。
 
         统一策略：顶层没有 ``role`` 但有字典型 ``data`` 就下钻一层；``role`` 不在
         已知三值内一律视为未知、拒绝授权。
         """
         if not isinstance(response, dict) or response.get("success") is False:
+            return None
+        status = str(response.get("status") or "").strip().lower()
+        if status and status != "ok":
+            return None
+        retcode = response.get("retcode")
+        if isinstance(retcode, int) and retcode != 0:
             return None
         member_info: Any = response
         # SnowLuma 形态下钻 data；再容忍未经 SDK 归一化的 {"success": True, "result": {...}} 包装
@@ -1094,6 +1117,7 @@ class GroupMuterPlugin(MaiBotPlugin):
         self._mute_status = MuteSessionTracker(
             self._schedule_expired_frequency_restore,
             self._schedule_session_save,
+            self._schedule_peek_verification,
         )
         # 静音会话持久化文件路径（on_load 解析 ctx.paths.data_dir 后填充；空串=不持久化）
         self._session_file: str = ""
@@ -1888,7 +1912,10 @@ class GroupMuterPlugin(MaiBotPlugin):
                     return False
                 # 回读校验"假成功"：set_adjust 报成功不代表频率真归零（实例缺失时 Host
                 # 静默放行）。实例存在并归零 → 读到 0；实例缺失 → 读到 1.0。
+                # float() 也放在 try 内：Host 返回失败信封时 SDK 不剥层、原样给 dict，
+                # float(dict) 的 TypeError 不能逃出去变成 never retrieved。
                 effective = await self.ctx.frequency.get_adjust(chat_id=stream_id)
+                effective_value = None if effective is None else float(effective)
                 if not self._frequency_entry_allowed(stream_id, group_id):
                     await self._restore_frequency_locked(stream_id)
                     return False
@@ -1899,7 +1926,7 @@ class GroupMuterPlugin(MaiBotPlugin):
                     exc_info=True,
                 )
                 return False
-            if effective is None or float(effective) > _PEEK_FREQUENCY_EPSILON:
+            if effective_value is None or effective_value > _PEEK_FREQUENCY_EPSILON:
                 # 假成功：频率未归零，但仍放行让 maisaka 创建实例并继续学习（理由见 docstring）。
                 # 不记入 _peek_confirmed，下一条会重新尝试 set_adjust，实例就绪后即可真正归零。
                 logger.warning(
@@ -1911,6 +1938,56 @@ class GroupMuterPlugin(MaiBotPlugin):
                 return True
             self._peek_confirmed.add(stream_id)
             return True
+
+    def _schedule_peek_verification(self, active_groups: List[str]) -> None:
+        """摘要循环每轮回调：对已确认窥屏的流回读一次调整值，撤销已漂移的确认。
+
+        根因：Host 的 ``clear_context`` 指令与心流 LRU 淘汰都会销毁 runtime，
+        下一条消息重建的 runtime 调整值回到 1.0；而 ``_peek_confirmed`` 快速路径
+        让入站守卫不再 set_adjust——不复核就会一直靠出站守卫硬拦到解除静音。
+        """
+        if self._unloading:
+            return
+        stream_ids = [
+            sid for sid in (self._mute_status.stream_for_group(g) for g in active_groups)
+            if sid and sid in self._peek_confirmed
+        ]
+        if not stream_ids:
+            return
+        task = asyncio.create_task(self._verify_peek_confirmed(stream_ids))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _verify_peek_confirmed(self, stream_ids: List[str]) -> None:
+        """逐流回读 get_adjust；未归零则撤销确认并后台重新进入窥屏。"""
+        for stream_id in stream_ids:
+            if self._unloading or stream_id not in self._peek_confirmed:
+                continue
+            try:
+                effective = await asyncio.wait_for(
+                    self.ctx.frequency.get_adjust(chat_id=stream_id),
+                    timeout=_PEEK_VERIFY_RPC_TIMEOUT,
+                )
+                effective_value = None if effective is None else float(effective)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("[mute_guard] 窥屏复核回读失败，跳过本轮 (stream=%s)", stream_id, exc_info=True)
+                continue
+            if effective_value is not None and effective_value <= _PEEK_FREQUENCY_EPSILON:
+                continue
+            # 回读期间若已被恢复并 pop 出确认集合，说明静音已解除，不要再把频率摁回 0
+            if stream_id not in self._peek_confirmed:
+                continue
+            self._peek_confirmed.discard(stream_id)
+            group_id = self._mute_status.group_for_stream(stream_id)
+            logger.warning(
+                "[mute_guard] 窥屏复核发现频率=%s 已漂移（runtime 可能被重建），撤销确认并重新进入窥屏 "
+                "(stream=%s, group=%s)",
+                effective, stream_id, group_id or "<unknown>",
+            )
+            if self._frequency_entry_allowed(stream_id, group_id):
+                self._spawn_peek_mode_entry(stream_id, group_id, label="peek_verify")
 
     async def _restore_frequency_adjustment(self, stream_id: str) -> None:
         """恢复放入独立任务，避免解除指令因等锁或 RPC 超过 Hook 预算。"""
@@ -2009,23 +2086,27 @@ class GroupMuterPlugin(MaiBotPlugin):
         """
         if not self.config.mute.llm_reply_enabled:
             return None
+
+        async def _fetch_and_generate() -> Any:
+            context_text = ""
+            if self.config.mute.llm_reply_use_context and stream_id:
+                context_text = await self._fetch_recent_context(stream_id)
+            rendered = (
+                self.config.mute.llm_reply_prompt
+                .replace("{event}", _LLM_EVENT_LABELS.get(event, event))
+                .replace("{fallback}", fallback)
+                .replace("{context}", context_text)
+            )
+            return await self.ctx.llm.generate(
+                prompt=rendered,
+                task_name="replyer",
+                max_tokens=_LLM_MAX_TOKENS,
+            )
+
         try:
             # 历史读取与生成共用总预算，避免慢历史查询绕过生成超时。
-            async with asyncio.timeout(_LLM_GENERATE_TIMEOUT):
-                context_text = ""
-                if self.config.mute.llm_reply_use_context and stream_id:
-                    context_text = await self._fetch_recent_context(stream_id)
-                rendered = (
-                    self.config.mute.llm_reply_prompt
-                    .replace("{event}", _LLM_EVENT_LABELS.get(event, event))
-                    .replace("{fallback}", fallback)
-                    .replace("{context}", context_text)
-                )
-                result = await self.ctx.llm.generate(
-                    prompt=rendered,
-                    task_name="replyer",
-                    max_tokens=_LLM_MAX_TOKENS,
-                )
+            # 用 wait_for 而非 asyncio.timeout：后者 3.11 才有，SDK 声明支持 3.10。
+            result = await asyncio.wait_for(_fetch_and_generate(), timeout=_LLM_GENERATE_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(
                 "[llm_reply] %s 历史读取或生成超时（总预算 %s 秒），回退固定回复", event, _LLM_GENERATE_TIMEOUT,
