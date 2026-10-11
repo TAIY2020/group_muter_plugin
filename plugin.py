@@ -5,19 +5,19 @@
 管理员可通过关键词指令、/muteon、/muteoff 或 @麦麦解除静音。
 
 实现方案：
-    1. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook。
-       此 Hook 在消息预处理完成后、Command 匹配之前触发，
-       关键词控制指令，以及开关启用时的 /muteon、/muteoff，会通过返回
-       {"action": "abort"} 消费；普通消息在纯窥屏模式下放行。
-    2. 主动沉默：注册 silence Tool，允许麦麦自主决定进入指定时长的沉默。
-    3. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
+    1. 命令控制：使用 @Command 正式注册 /muteon 和 /muteoff；
+       命令处理器复用统一的静音决策、权限、回复和 Maisaka 上下文流程。
+    2. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook，
+       处理关键词控制指令、@麦麦解除，以及静音期间的普通消息。
+    3. 主动沉默：注册 silence Tool，允许麦麦自主决定进入指定时长的沉默。
+    4. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
        此 Hook 在消息即将发送前触发，用于拦截静音前已进入思考流程、
        但在静音后才生成回复的"漏网"消息。
-    4. 只读查询：公开 group_muter.get_status API，供戳一戳等绕过发送服务
+    5. 只读查询：公开 group_muter.get_status API，供戳一戳等绕过发送服务
        直接调适配器 API 的插件在动作前自查静音状态。
 """
 
-from maibot_sdk import API, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import API, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from pydantic import field_validator, model_validator
 
@@ -31,7 +31,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 
@@ -63,6 +63,8 @@ CONFIG_SCHEMA_VERSION = "2.4.0"
 _AT_PREFIX_PATTERN = re.compile(r"@\S+")
 _MUTE_ON_COMMAND = "/muteon"
 _MUTE_OFF_COMMAND = "/muteoff"
+_MUTE_ON_COMMAND_COMPONENT_NAME = "TAIY2020.group-muter-plugin.muteon"
+_MUTE_OFF_COMMAND_COMPONENT_NAME = "TAIY2020.group-muter-plugin.muteoff"
 
 # 窥屏确认后的周期复核：runtime 被 Host 重建（清空上下文指令 / LRU 淘汰）后调整值
 # 回到 1.0，插件的 _peek_confirmed 快速路径却不再 set_adjust。摘要循环每轮对已确认
@@ -768,6 +770,26 @@ def _is_builtin_mute_command(
     )
 
 
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    """把 Command 运行时可能传入的模型对象转换为浅层字典。"""
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="python")
+        except TypeError:
+            dumped = model_dump()
+        return dict(dumped) if isinstance(dumped, dict) else {}
+    if hasattr(value, "__dict__"):
+        return {
+            key: item
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return {}
+
+
 # 模型"不听话"时常见的包裹引号对：左引号 → 对应右引号
 _LLM_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
 
@@ -1419,8 +1441,9 @@ class _RefCountedLock:
 class GroupMuterPlugin(MaiBotPlugin):
     """群聊静音插件。
 
+    使用 @Command 注册 /muteon 和 /muteoff，
     使用 @HookHandler 订阅 chat.receive.after_process Hook，
-    在消息预处理完成后、Command 匹配之前拦截静音群的消息。
+    在消息预处理完成后拦截关键词和静音期间的普通消息。
     """
 
     config_model = GroupMuterConfig
@@ -1464,10 +1487,14 @@ class GroupMuterPlugin(MaiBotPlugin):
         # _restore_all_frequency_adjustments 跑完之后又 set_adjust(0)，把某 stream 的
         # 频率永久留在 0（且被下一代实例的 get_adjust 误读为原始 baseline）。
         self._unloading = False
+        # 只有两个 COMMAND 组件都同步成功后，入站 Hook 才会把直达斜杠命令
+        # 交给正式命令分发器；同步失败时回退到 Hook 路径，避免命令失效。
+        self._slash_commands_delegated = False
 
     async def on_load(self) -> None:
         self._admin_roster.refresh(self.config.user_control)
         await self._sync_silence_tool_state()
+        await self._sync_slash_command_state()
         if self.config.mute.persist_sessions:
             await self._init_session_persistence()
         logger.info("群聊静音插件(v%s)初始化完成。", PLUGIN_VERSION)
@@ -1640,6 +1667,7 @@ class GroupMuterPlugin(MaiBotPlugin):
         if scope == "self":
             self._admin_roster.refresh(self.config.user_control)
             await self._sync_silence_tool_state()
+            await self._sync_slash_command_state()
             if not self.config.mute.learn_while_muted:
                 await self._restore_all_frequency_adjustments()
             # 持久化开关热切换：关→停止接收并排空在途写入；开→补初始化。
@@ -1684,6 +1712,83 @@ class GroupMuterPlugin(MaiBotPlugin):
                 enabled,
                 exc_info=True,
             )
+
+    async def _sync_slash_command_state(self) -> None:
+        """让正式斜杠命令组件跟随配置开关。"""
+        enabled = self.config.mute.enable_slash_commands
+        component_method = (
+            self.ctx.component.enable_component
+            if enabled
+            else self.ctx.component.disable_component
+        )
+        sync_succeeded = True
+        for component_name in (
+            _MUTE_ON_COMMAND_COMPONENT_NAME,
+            _MUTE_OFF_COMMAND_COMPONENT_NAME,
+        ):
+            try:
+                result = await component_method(
+                    component_name,
+                    "COMMAND",
+                    scope="global",
+                )
+                if result is False or (
+                    isinstance(result, dict) and result.get("success") is False
+                ):
+                    sync_succeeded = False
+                    logger.warning(
+                        "[mute_guard] 同步斜杠命令组件状态失败 "
+                        "(component=%s, enabled=%s): %s",
+                        component_name,
+                        enabled,
+                        result.get("error", result) if isinstance(result, dict) else result,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                sync_succeeded = False
+                logger.warning(
+                    "[mute_guard] 同步斜杠命令组件状态失败 "
+                    "(component=%s, enabled=%s)",
+                    component_name,
+                    enabled,
+                    exc_info=True,
+                )
+        self._slash_commands_delegated = enabled and sync_succeeded
+
+    @Command(
+        "muteon",
+        description="开启或续期当前群聊的静音状态",
+        pattern=r"^/muteon\s*$",
+    )
+    async def handle_mute_on_command(
+        self,
+        message: Any = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, int]:
+        """处理正式注册的 ``/muteon`` 命令。"""
+        return await self._handle_registered_mute_command(
+            _MUTE_ON_COMMAND,
+            message=message,
+            **kwargs,
+        )
+
+    @Command(
+        "muteoff",
+        description="解除当前群聊的静音状态",
+        pattern=r"^/muteoff\s*$",
+    )
+    async def handle_mute_off_command(
+        self,
+        message: Any = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, int]:
+        """处理正式注册的 ``/muteoff`` 命令。"""
+        return await self._handle_registered_mute_command(
+            _MUTE_OFF_COMMAND,
+            message=message,
+            **kwargs,
+        )
 
     @Tool(
         "silence",
@@ -1800,6 +1905,50 @@ class GroupMuterPlugin(MaiBotPlugin):
         """
         context = MessageContext.from_message(message)
 
+        # 斜杠命令已由正式 @Command 组件接管。这里必须放行，避免在
+        # Command 分发前被 Hook 消费；@ 麦麦后再跟命令的旧写法仍由
+        # 原有 Hook 路径处理。
+        if (
+            self._slash_commands_delegated
+            and (
+                _is_builtin_mute_command(context.plain_text, _MUTE_ON_COMMAND)
+                or _is_builtin_mute_command(context.plain_text, _MUTE_OFF_COMMAND)
+            )
+        ):
+            return None
+
+        return await self._process_mute_context(context)
+
+    async def _handle_registered_mute_command(
+        self,
+        command: str,
+        *,
+        message: Any = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, int]:
+        """把正式 Command 组件转换为现有静音决策/副作用流程。"""
+        if not self.config.mute.enable_slash_commands:
+            return False, "", 0
+
+        context = self._message_context_from_command(
+            command,
+            message=message,
+            kwargs=kwargs,
+        )
+        context = replace(context, plain_text=command)
+        result = await self._process_mute_context(context)
+        if isinstance(result, dict) and result.get("action") == "abort":
+            # 回复已经由 _dispatch_intent 后台发送；返回空正文避免 Command
+            # 分发器再次发送一条重复回复，拦截等级 2 与 Hook 保持一致。
+            return True, "", 2
+        return False, "", 0
+
+    async def _process_mute_context(
+        self,
+        context: MessageContext,
+    ) -> Optional[Dict[str, Any]]:
+        """处理一条已解析的静音控制/普通群消息。"""
+
         known_stream_id = context.stream_id or self._mute_status.stream_for_group(context.group_id)
         had_session = self._mute_status.has_mute_session(context.group_id)
         muted = self._mute_status.is_muted(context.group_id)
@@ -1822,6 +1971,82 @@ class GroupMuterPlugin(MaiBotPlugin):
         if intent.kind in ("start_mute", "renew_mute", "end_mute"):
             await self._append_control_trigger_to_maisaka(context, intent.kind)
         return await self._dispatch_intent(intent)
+
+    @staticmethod
+    def _message_context_from_command(
+        command: str,
+        *,
+        message: Any,
+        kwargs: Dict[str, Any],
+    ) -> MessageContext:
+        """兼容 Command 运行时传入的消息字典与扁平 kwargs。"""
+        raw_message = _coerce_mapping(message)
+
+        raw_message.setdefault(
+            "processed_plain_text",
+            str(
+                raw_message.get("processed_plain_text")
+                or kwargs.get("processed_plain_text")
+                or kwargs.get("plain_text")
+                or command
+            ),
+        )
+        raw_message.setdefault(
+            "session_id",
+            str(raw_message.get("session_id") or kwargs.get("stream_id") or kwargs.get("session_id") or ""),
+        )
+        raw_message.setdefault(
+            "platform",
+            str(raw_message.get("platform") or kwargs.get("platform") or ""),
+        )
+        raw_message.setdefault(
+            "is_at",
+            bool(raw_message.get("is_at") or kwargs.get("is_at") or kwargs.get("is_mentioned")),
+        )
+
+        message_info = _coerce_mapping(raw_message.get("message_info"))
+        user_info = _coerce_mapping(
+            message_info.get("user_info") or raw_message.get("user_info"),
+        )
+        group_info = _coerce_mapping(
+            message_info.get("group_info") or raw_message.get("group_info"),
+        )
+        additional_config = _coerce_mapping(
+            message_info.get("additional_config") or raw_message.get("additional_config"),
+        )
+
+        for field_name in ("user_id", "user_cardname", "user_nickname"):
+            if not user_info.get(field_name):
+                value = kwargs.get(field_name)
+                if value is None:
+                    value = raw_message.get(field_name)
+                if value is not None:
+                    user_info[field_name] = value
+        for field_name in ("group_id", "group_name"):
+            if not group_info.get(field_name):
+                value = kwargs.get(field_name)
+                if value is None:
+                    value = raw_message.get(field_name)
+                if value is not None:
+                    group_info[field_name] = value
+        if (
+            not additional_config.get("platform_io_target_group_id")
+            and (
+                kwargs.get("platform_io_target_group_id") is not None
+                or raw_message.get("platform_io_target_group_id") is not None
+            )
+        ):
+            additional_config["platform_io_target_group_id"] = (
+                kwargs.get("platform_io_target_group_id")
+                if kwargs.get("platform_io_target_group_id") is not None
+                else raw_message.get("platform_io_target_group_id")
+            )
+
+        message_info["user_info"] = user_info
+        message_info["group_info"] = group_info
+        message_info["additional_config"] = additional_config
+        raw_message["message_info"] = message_info
+        return MessageContext.from_message(raw_message)
 
     async def _dispatch_intent(self, intent: MuteIntent) -> Optional[Dict[str, Any]]:
         """根据 intent 执行副作用（修改 mute 状态 + 发回复 + 日志）。

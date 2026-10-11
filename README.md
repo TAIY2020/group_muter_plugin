@@ -4,17 +4,17 @@
 
 这个插件为群组管理员提供了一个强大的工具来让麦麦“静音”（闭嘴）。当群聊需要专注讨论或减少麦麦干扰时，管理员可以一键“静音”麦麦。默认情况下，静音期间麦麦会进入纯窥屏状态：继续读取群聊上下文，但通过发言频率 0 和出站守卫避免发言；关闭 `mute.learn_while_muted` 后才会直接拦截普通群消息，直到被管理员唤醒或到达静音时间自动解除静音。
 
-> 本版本基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，并注册 `silence` Tool 供麦麦主动进入沉默，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本基于 **MaiBot SDK v2** 重写，使用 `@Command` 正式注册 `/muteon`、`/muteoff`，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，并注册 `silence` Tool 供麦麦主动进入沉默，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
 - **动态控制**: 无需重启，通过简单的聊天命令即可实时开启或关闭麦麦的静音模式。
 - **双重拦截**:
-  - **入站拦截**: 通过 `chat.receive.after_process` Hook 在消息预处理后拦截，阻止消息进入后续流程。
+  - **入站拦截**: 通过 `chat.receive.after_process` Hook 在消息预处理后拦截关键词和静音期间的普通消息；`/muteon`、`/muteoff` 由正式 Command 组件处理。
   - **出站拦截**: 通过 `send_service.before_send` Hook 拦截静音前已进入思考流程、但在静音后才生成回复的“漏网”消息。
 - **主动沉默工具**: 注册 `silence` LLM Tool，麦麦可在判断自己不适合继续发言时主动让当前群聊进入沉默。
 - **多种唤醒方式**:
-  - **命令唤醒**: 管理员可使用 `/muteon`、`/muteoff`，或配置的关键词控制静音状态；斜杠命令可单独关闭。
+  - **命令唤醒**: 管理员可使用已注册的 `/muteon`、`/muteoff` 命令，或配置的关键词控制静音状态；斜杠命令可单独关闭。
   - **@提及唤醒**: 管理员在群里 `@` 麦麦，即可立即唤醒麦麦。
   - **自动解除**: 静音时间到达后，麦麦将自动解除静音，恢复正常聊天。
 - **高度可配置**: 静音时长、触发关键词、麦麦的回复语均可在配置文件或 Web UI 中轻松修改。
@@ -52,7 +52,7 @@
 
 ### 开启静音
 
-管理员在群聊中发送 `/muteon` 或配置的静音关键词即可开启静音模式。`/muteon` 是精确匹配的内置命令，受 `mute.enable_slash_commands` 控制但不受关键词列表配置影响；静音期间再次发送会续期，成功执行后会按对应事件说明写入 Maisaka 上下文。
+管理员在群聊中发送 `/muteon` 或配置的静音关键词即可开启静音模式。`/muteon` 是 MaiBot SDK 正式注册的精确命令组件，受 `mute.enable_slash_commands` 控制但不受关键词列表配置影响；关闭开关时两个斜杠命令组件会同步禁用。静音期间再次发送会续期，成功执行后会按对应事件说明写入 Maisaka 上下文。
 
 - **默认关键词**: `Mute True` 或 `安安你去看书去`
 - **麦麦回复**: 由 `mute.mute_reply` 配置（默认 `好吧，那我去看会书📘，你们先聊...`）
@@ -150,7 +150,7 @@
 | `mute.duration_seconds` | int | `1200` | 静音持续时间（秒），范围 60 ~ 86400，越界值自动收敛到边界 |
 | `mute.mute_keywords` | list | `["Mute True", "安安你去看书去"]` | 触发静音的关键词列表 |
 | `mute.unmute_keywords` | list | `["Mute False", "安安别看了"]` | 解除静音的关键词列表 |
-| `mute.enable_slash_commands` | bool | `true` | 是否启用内置 `/muteon` 和 `/muteoff` 命令；不影响关键词匹配 |
+| `mute.enable_slash_commands` | bool | `true` | 是否启用已注册的 `/muteon` 和 `/muteoff` 命令组件；不影响关键词匹配 |
 | `mute.enable_unmute` | bool | `true` | 是否启用关键词解除功能；不影响内置 `/muteoff` 命令 |
 | `mute.at_mention_break` | bool | `true` | 管理员 @麦麦 时是否自动解除静音 |
 | `mute.mute_reply` | str | `好吧，那我去看会书📘，你们先聊...` | 开启静音时麦麦的回复语 |
@@ -216,7 +216,8 @@ v2.x 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 | 项目 | v1.x (旧版) | v2.x (新版) |
 | ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
-| 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (入站 + 出站双重拦截) |
+| 命令注册 | `BaseCommand` | `@Command` 正式注册 `/muteon`、`/muteoff` |
+| 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (关键词/普通消息入站 + 出站双重拦截) |
 | 配置管理 | `config_schema` 字典 + `ConfigField` | `PluginConfigBase` 强类型模型 (Pydantic) |
 | 配置热重载 | 不支持 | 支持 `on_config_update` 回调 |
 | 日志过滤 | 自定义 `GroupMuterLogFilter` 过滤控制台日志 | 由 SDK 统一管理 |
