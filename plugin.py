@@ -213,6 +213,12 @@ class MuteSection(PluginConfigBase):
         description="LLM 生成回复时是否读取最近 10 条群聊消息作为上下文",
         json_schema_extra={"label": "LLM 读取群聊上下文"},
     )
+    llm_reply_max_tokens: int = Field(
+        default=_LLM_MAX_TOKENS,
+        ge=1,
+        description="LLM 生成回复的最大 token 数，开启思考时可适当调大",
+        json_schema_extra={"label": "LLM 最大 token 数"},
+    )
 
     @field_validator("mute_keywords", "unmute_keywords", mode="before")
     @classmethod
@@ -2100,7 +2106,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             return await self.ctx.llm.generate(
                 prompt=rendered,
                 task_name="replyer",
-                max_tokens=_LLM_MAX_TOKENS,
+                max_tokens=self.config.mute.llm_reply_max_tokens,
             )
 
         try:
