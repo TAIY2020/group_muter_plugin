@@ -134,6 +134,7 @@
 - **超时与 fallback**：历史读取和 LLM 生成共享 30 秒总预算，超时、异常或返回空文本时自动回退到对应的固定回复。
 - **过时回复**：同群只保留最新动态控制回复，发送前核对会话快照；解除、续期或过期后，旧生成结果不会重新发送。取消插件等待不代表远端模型请求一定停止计费。
 - **输出约束**：LLM 输出会做兜底清理——剥去包裹引号、多行只取第一个非空行、超过 100 字符截断；清理后为空则回退固定回复。
+- **断句开关**：`mute.llm_reply_split_enabled` 默认开启；句末标点直接断开，逗号前或逗号后的片段超过 8 个字符时以逗号为界拆分，最多发送 5 条；关闭后恢复为单条消息发送。
 - **上下文**：最多读取 10 条群聊消息，每条正文最多 500 字符，上下文总计最多 3000 字符；昵称最多 80 字符。读取失败不阻断生成，仍以无上下文方式继续。
 - **主动沉默工具**：`silence` 工具的 `message` 字段是回给模型的工具结果而非群消息，始终使用固定提示 `已进入沉默状态` / `已续期沉默状态`，不受本功能影响。
 
@@ -155,6 +156,7 @@
 | `mute.llm_reply_enabled` | bool | `false` | 是否使用 LLM 动态生成回复文案（关闭时使用各固定回复字段） |
 | `mute.llm_reply_prompt` | str | `根据以下事件和群聊语气...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` 占位符 |
 | `mute.llm_reply_use_context` | bool | `false` | LLM 生成回复时是否读取最近 10 条群聊消息作为上下文 |
+| `mute.llm_reply_split_enabled` | bool | `true` | 是否将 LLM 动态回复按规则拆分后分多条发送 |
 | `user_control.list_type` | str | `whitelist` | 权限模式：`whitelist` 仅名单内可操作；`blacklist` 名单外可操作（空名单 = 全员可操作） |
 | `user_control.list` | list | `[]` | 拥有静音操作权限的 QQ 号列表（字符串，如 `["123456"]`） |
 | `user_control.authorization_mode` | str | `list` | `list` 使用名单；`group_admin` 使用 QQ 群角色；`list_or_group_admin` 任一满足即授权 |
