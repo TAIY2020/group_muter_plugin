@@ -23,6 +23,7 @@ from pydantic import field_validator, model_validator
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 import json
@@ -97,6 +98,14 @@ _LLM_CONTEXT_MESSAGE_MAX_CHARS = 500
 # LLM 回复的字符数上限（_sanitize_llm_reply 兜底截断）：
 # 输出直接进群，且出站豁免令牌按文本精确匹配——越短越稳
 _LLM_REPLY_MAX_CHARS = 100
+# 超长时优先在这些句末标点之后截断，避免把一句话切成半截直接发进群
+_LLM_SENTENCE_END_CHARS = frozenset("。！？!?…～~")
+# 句末标点后紧跟的闭合引号/括号一并保留，避免截出不配对的引号
+_LLM_CLOSING_CHARS = frozenset("」』”’\"'）)")
+# 句末截断至少保留的字符数：首句过短时按标点截几乎没内容，退回硬截更接近原意
+_LLM_REPLY_MIN_KEEP_CHARS = _LLM_REPLY_MAX_CHARS // 4
+_LLM_REPLY_MAX_SENTENCE_NUM = 8
+_LLM_REPLY_MAX_PARTS = 3
 
 
 # --- 配置模型 ---
@@ -212,6 +221,17 @@ class MuteSection(PluginConfigBase):
         default=False,
         description="LLM 生成回复时是否读取最近 10 条群聊消息作为上下文",
         json_schema_extra={"label": "LLM 读取群聊上下文"},
+    )
+    llm_reply_split_enabled: bool = Field(
+        default=True,
+        description="是否将 LLM 动态回复按句子拆分后分多条发送",
+        json_schema_extra={"label": "LLM 回复断句"},
+    )
+    llm_reply_max_tokens: int = Field(
+        default=_LLM_MAX_TOKENS,
+        ge=1,
+        description="LLM 生成回复的最大 token 数，开启思考时可适当调大",
+        json_schema_extra={"label": "LLM 最大 token 数"},
     )
 
     @field_validator("mute_keywords", "unmute_keywords", mode="before")
@@ -721,8 +741,29 @@ def _strip_at_prefix(text: str) -> str:
 _LLM_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
 
 
+def _truncate_at_sentence_end(text: str, limit: int, min_keep: int) -> str:
+    """超过 ``limit`` 时在上限内回退到最后一个句末标点处截断。
+
+    硬截 ``text[:limit]`` 常把一句话切成半截直接发进群。这里在前 ``limit`` 个
+    字符里找最后一个句末标点，连同紧跟的闭合引号/括号一并保留；找不到标点、
+    或保留量不足 ``min_keep``（首句过短，按标点截几乎没内容）时退回硬截。
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(char) for char in _LLM_SENTENCE_END_CHARS)
+    if cut < 0:
+        return head
+    end = cut + 1
+    while end < len(head) and head[end] in _LLM_CLOSING_CHARS:
+        end += 1
+    if end < min_keep:
+        return head
+    return head[:end].rstrip()
+
+
 def _sanitize_llm_reply(raw: str) -> str:
-    """LLM 回复的输出兜底清理：剥包裹引号、压成单行、超长截断。
+    """LLM 回复的输出兜底清理：剥包裹引号、压成单行、超长时在句末截断。
 
     提示词已要求"只输出回复正文"，这里是模型不听话时的硬约束——
     输出会原样发进群，且出站豁免令牌按文本精确匹配，输出越短越怪
@@ -739,7 +780,226 @@ def _sanitize_llm_reply(raw: str) -> str:
             break
     else:
         return ""
-    return text[:_LLM_REPLY_MAX_CHARS]
+    return _truncate_at_sentence_end(text, _LLM_REPLY_MAX_CHARS, _LLM_REPLY_MIN_KEEP_CHARS)
+
+
+def _is_english_letter(char: str) -> bool:
+    """判断字符是否为英文字母。"""
+    return "a" <= char.lower() <= "z"
+
+
+def _split_into_sentence_segments(text: str) -> List[tuple[str, str]]:
+    """复制 MaiBot 规则断句器，返回 (句子内容, 尾随分隔符)。
+
+    该实现与 MaiBot ``src.chat.utils.utils`` 中的规则分割器保持一致：
+    先规范换行，再识别逗号、句号、分号、空格和换行分隔符；
+    引号内部不分割，冒号两侧和英文/数字中间的空格也不分割；
+    最后按原文长度概率性合并相邻片段。
+    """
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    text = re.sub(r"\n\s*([，,。;\s])", r"\n\1", text)
+    text = re.sub(r"([，,。;\s])\s*\n", r"\1\n", text)
+
+    len_text = len(text)
+    if len_text < 3:
+        if random.random() < 0.01:
+            return [(char, "") for char in text]
+        return [(text, "")]
+
+    quote_chars = {
+        '"',
+        "'",
+        "“",
+        "”",
+        "‘",
+        "’",
+        "「",
+        "」",
+        "『",
+        "』",
+    }
+    inside_quote = [False] * len_text
+    in_quote = False
+    current_quote_char = ""
+    for index, char in enumerate(text):
+        if char in quote_chars:
+            if not in_quote:
+                in_quote = True
+                current_quote_char = char
+                inside_quote[index] = False
+            else:
+                if char == current_quote_char or (
+                    char in {'"', "'"} and current_quote_char in {'"', "'"}
+                ):
+                    in_quote = False
+                    current_quote_char = ""
+                inside_quote[index] = False
+        else:
+            inside_quote[index] = in_quote
+
+    separators = {"，", ",", " ", "。", ";", "\n"}
+    segments: List[tuple[str, str]] = []
+    current_segment = ""
+
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in separators:
+            if inside_quote[index]:
+                can_split = False
+            elif char == "\n":
+                can_split = True
+            else:
+                can_split = True
+                if index > 0 and text[index - 1] in {":", "："}:
+                    can_split = False
+                if index < len(text) - 1 and text[index + 1] in {":", "："}:
+                    can_split = False
+
+                if can_split and char == " " and 0 < index < len(text) - 1:
+                    prev_char = text[index - 1]
+                    next_char = text[index + 1]
+                    if prev_char in {"-", "—"} or next_char in {"-", "—"}:
+                        can_split = False
+                    else:
+                        prev_is_alnum = prev_char.isdigit() or _is_english_letter(prev_char)
+                        next_is_alnum = next_char.isdigit() or _is_english_letter(next_char)
+                        if prev_is_alnum and next_is_alnum:
+                            can_split = False
+
+            if can_split:
+                if current_segment:
+                    segments.append((current_segment, char))
+                elif char in {" ", "\n"}:
+                    segments.append(("", char))
+                current_segment = ""
+            else:
+                current_segment += char
+        else:
+            current_segment += char
+        index += 1
+
+    if current_segment:
+        segments.append((current_segment, ""))
+
+    segments = [(content, separator) for content, separator in segments if content or separator]
+    if not segments:
+        return [(text, "")] if text else []
+
+    if len_text < 12:
+        split_strength = 0.2
+    elif len_text < 32:
+        split_strength = 0.6
+    else:
+        split_strength = 0.7
+    merge_probability = 1.0 - split_strength
+
+    merged_segments: List[tuple[str, str]] = []
+    index = 0
+    while index < len(segments):
+        current_content, current_separator = segments[index]
+        if (
+            index + 1 < len(segments)
+            and current_content
+            and current_separator != "\n"
+            and random.random() < merge_probability
+        ):
+            next_content, next_separator = segments[index + 1]
+            if next_content:
+                merged_segments.append(
+                    (current_content + current_separator + next_content, next_separator)
+                )
+            else:
+                merged_segments.append((current_content, next_separator))
+            index += 2
+        else:
+            merged_segments.append((current_content, current_separator))
+            index += 1
+
+    sentence_segments = [
+        (content, separator)
+        for content, separator in merged_segments
+        if content and content.strip()
+    ]
+    sentence_segments = [
+        (normalized_sentence, separator)
+        for sentence, separator in sentence_segments
+        if (
+            normalized_sentence := re.sub(
+                r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", sentence
+            ).strip()
+        )
+    ]
+
+    logger.debug(
+        "LLM 回复规则断句结果: %s",
+        [sentence for sentence, _separator in sentence_segments],
+    )
+    return sentence_segments
+
+
+def _merge_sentence_segments_to_max_count(
+    segments: List[tuple[str, str]],
+    max_count: int,
+) -> List[tuple[str, str]]:
+    """按 MaiBot 的均匀分组策略压缩消息条数，并恢复组内分隔符。"""
+    if len(segments) <= max_count:
+        return segments
+    if max_count <= 0:
+        return []
+
+    segment_count = len(segments)
+    group_starts = {0}
+    evenly_spaced_starts: List[int] = []
+    start_index = 0
+    for group_index in range(max_count):
+        remaining_segments = segment_count - start_index
+        remaining_groups = max_count - group_index
+        group_size = (remaining_segments + remaining_groups - 1) // remaining_groups
+        evenly_spaced_starts.append(start_index)
+        start_index += group_size
+
+    for candidate_start in evenly_spaced_starts:
+        if len(group_starts) >= max_count:
+            break
+        group_starts.add(candidate_start)
+
+    sorted_starts = sorted(group_starts)
+    merged_segments: List[tuple[str, str]] = []
+    for group_index, group_start in enumerate(sorted_starts):
+        group_end = (
+            sorted_starts[group_index + 1]
+            if group_index + 1 < len(sorted_starts)
+            else segment_count
+        )
+        group = segments[group_start:group_end]
+        merged_text_parts: List[str] = []
+        for position, (content, separator) in enumerate(group):
+            merged_text_parts.append(content)
+            if position < len(group) - 1:
+                merged_text_parts.append(separator)
+        merged_segments.append(("".join(merged_text_parts), group[-1][1]))
+    return merged_segments
+
+
+def _split_llm_reply(text: str, overflow_reply: str) -> List[str]:
+    """使用 MaiBot 官方规则断句器处理 LLM 回复。"""
+    if not text:
+        return []
+
+    sentence_segments = _split_into_sentence_segments(text)
+    if len(sentence_segments) > _LLM_REPLY_MAX_SENTENCE_NUM:
+        logger.warning(
+            "LLM 回复规则断句后超过最大句段数 (%s)，回退固定回复",
+            _LLM_REPLY_MAX_SENTENCE_NUM,
+        )
+        return [overflow_reply]
+
+    sentence_segments = _merge_sentence_segments_to_max_count(
+        sentence_segments,
+        _LLM_REPLY_MAX_PARTS,
+    )
+    return [sentence for sentence, _separator in sentence_segments if sentence.strip()]
 
 
 def _is_keyword_in_text(
@@ -1339,7 +1599,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="stream_id",
                 param_type=ToolParamType.STRING,
-                description="当前聊天流 ID，通常由系统上下文自动注入、一般无需填写；必须是群聊聊天流。",
+                description="留空即可，系统会自动注入当前聊天流；填写的值不会覆盖系统注入的会话。目标必须是群聊聊天流。",
                 required=False,
             ),
             ToolParameterInfo(
@@ -1680,8 +1940,10 @@ class GroupMuterPlugin(MaiBotPlugin):
         """从工具参数与 Host 注入的上下文解析并**核验**目标群聊流。
 
         Host 派发工具调用时会把当前会话的 stream_id / chat_id / group_id 注入参数，
-        但只在模型没填或填空时才补——模型填了非空错值不会被覆盖。因此参数里的
-        group_id 与 stream_id 不一定指向同一个群，这里不直接信任它们的组合：
+        但只在模型没填或填空时才补——模型填了非空错值不会被覆盖。其中 chat_id
+        不在工具 schema 里、模型不会填，恒为 Host 注入的当前会话流，是唯一不受
+        模型参数左右的流标识，故优先采用；声明参数 stream_id 仅作回退。即便如此，
+        参数里的 group_id 与流不一定指向同一个群，这里不直接信任它们的组合：
 
         * 已在静音中的流：tracker 里的 stream → group 映射来自上一次核验，直接复用；
         * 其它：按 stream_id 反查 Host 的真实群聊流，命中才认；未命中（流不存在
@@ -1689,15 +1951,21 @@ class GroupMuterPlugin(MaiBotPlugin):
         * 参数里带了 group_id 却与反查结果不一致（模型把别的群的 stream_id 填进了
           当前群的调用）→ 同样返回空 group_id 拒绝，避免 A 群记静音、B 流被调频。
         """
+        declared_sid = str(stream_id or kwargs.get("stream_id") or "").strip()
         sid = str(
-            stream_id
-            or kwargs.get("stream_id")
-            or kwargs.get("chat_id")
+            kwargs.get("chat_id")
+            or declared_sid
             or kwargs.get("session_id")
             or ""
         ).strip()
         if not sid:
             return MessageContext()
+        if declared_sid and declared_sid != sid:
+            # 模型往声明参数里填了与当前会话不同的流：不采用，只记日志便于排查。
+            logger.warning(
+                "[mute_guard] 主动沉默参数 stream_id=%s 与 Host 注入的 chat_id=%s 不一致，按 chat_id 执行",
+                declared_sid, sid,
+            )
         claimed_group_id = str(kwargs.get("group_id") or "").strip()
 
         group_id = self._mute_status.group_for_stream(sid)
@@ -1819,6 +2087,17 @@ class GroupMuterPlugin(MaiBotPlugin):
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=0.25)
         except asyncio.TimeoutError:
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 任务内部已把全部 RPC try 住，这里兜的是残余的意外异常。若放它逃进
+            # hook，ErrorPolicy.SKIP 会丢弃本 handler 的返回值（abort 丢失）、消息
+            # 静默放行——对拦截路径是 fail-open。统一按"窥屏不可用"退回入站拦截。
+            logger.warning(
+                "[mute_guard] 进入纯窥屏时发生意外异常，退回入站拦截 (stream=%s)",
+                stream_id, exc_info=True,
+            )
             return False
 
     def _frequency_entry_allowed(self, stream_id: str, group_id: str = "") -> bool:
@@ -2000,6 +2279,16 @@ class GroupMuterPlugin(MaiBotPlugin):
             await asyncio.wait_for(asyncio.shield(task), timeout=0.25)
         except asyncio.TimeoutError:
             pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 恢复任务内部已自行记录失败；这里兜的是逃出任务的意外异常。若让它
+            # 传进 hook，ErrorPolicy.SKIP 会丢掉调用方的 abort——解除指令本身会
+            # 漏进主链。恢复值仍保留在 _frequency_restore_values，下次重试。
+            logger.warning(
+                "[mute_guard] 等待恢复发言频率时发生意外异常 (stream=%s)",
+                stream_id, exc_info=True,
+            )
 
     async def _restore_frequency_serialized(self, stream_id: str) -> None:
         """恢复因纯窥屏模式临时覆盖的发言频率调整值。
@@ -2100,7 +2389,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             return await self.ctx.llm.generate(
                 prompt=rendered,
                 task_name="replyer",
-                max_tokens=_LLM_MAX_TOKENS,
+                max_tokens=self.config.mute.llm_reply_max_tokens,
             )
 
         try:
@@ -2225,8 +2514,16 @@ class GroupMuterPlugin(MaiBotPlugin):
         group_id: str = "",
         expected_session: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """LLM 生成 + 出站豁免 + 发送，在后台任务中完成。"""
-        reply = (await self._generate_llm_reply(event, fallback, stream_id)) or fallback
+        """LLM 生成 + 断句 + 出站豁免 + 发送，在后台任务中完成。"""
+        generated_reply = await self._generate_llm_reply(event, fallback, stream_id)
+        reply = generated_reply or fallback
+        replies = (
+            _split_llm_reply(reply, fallback)
+            if generated_reply and self.config.mute.llm_reply_split_enabled
+            else [reply]
+        )
+        if not replies:
+            replies = [reply]
         if (
             self._unloading
             or self._llm_control_tasks.get(group_id) is not asyncio.current_task()
@@ -2236,8 +2533,10 @@ class GroupMuterPlugin(MaiBotPlugin):
         if group_id and label in ("start_mute", "renew_mute"):
             if self._mute_status.remaining_seconds(group_id) <= 0:
                 return
-            self._mute_status.set_send_exempt(group_id, reply)
-        await self._send_control_message(reply, stream_id, label=label)
+            for part in replies:
+                self._mute_status.set_send_exempt(group_id, part)
+        for part in replies:
+            await self._send_control_message(part, stream_id, label=label)
 
     def _spawn_control_send(self, text: str, stream_id: str, *, label: str) -> None:
         """后台发送控制消息，与入站 hook 的决策返回解耦。
