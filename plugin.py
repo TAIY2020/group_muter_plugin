@@ -97,6 +97,8 @@ _LLM_CONTEXT_MESSAGE_MAX_CHARS = 500
 # LLM 回复的字符数上限（_sanitize_llm_reply 兜底截断）：
 # 输出直接进群，且出站豁免令牌按文本精确匹配——越短越稳
 _LLM_REPLY_MAX_CHARS = 100
+_LLM_REPLY_MAX_PARTS = 5
+_LLM_REPLY_COMMA_SPLIT_MIN_CHARS = 8
 
 
 # --- 配置模型 ---
@@ -212,6 +214,17 @@ class MuteSection(PluginConfigBase):
         default=False,
         description="LLM 生成回复时是否读取最近 10 条群聊消息作为上下文",
         json_schema_extra={"label": "LLM 读取群聊上下文"},
+    )
+    llm_reply_split_enabled: bool = Field(
+        default=True,
+        description="是否将 LLM 动态回复按句子拆分后分多条发送",
+        json_schema_extra={"label": "LLM 回复断句"},
+    )
+    llm_reply_max_tokens: int = Field(
+        default=_LLM_MAX_TOKENS,
+        ge=1,
+        description="LLM 生成回复的最大 token 数，开启思考时可适当调大",
+        json_schema_extra={"label": "LLM 最大 token 数"},
     )
 
     @field_validator("mute_keywords", "unmute_keywords", mode="before")
@@ -740,6 +753,82 @@ def _sanitize_llm_reply(raw: str) -> str:
     else:
         return ""
     return text[:_LLM_REPLY_MAX_CHARS]
+
+
+def _split_llm_reply(text: str) -> List[str]:
+    """按 MaiBot 规则断句的主要边界拆分动态回复。
+
+    句末标点会直接断开；逗号只有在逗号前或逗号后的片段超过八个字符时
+    才作为分隔点，避免很短的口语片段被拆得过碎。
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    sentence_endings = set("。！？!?；;.\n")
+    closing_quotes = set("\"'”’」』】》）)]")
+    sentence_parts: List[str] = []
+    current: List[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        current.append(char)
+        index += 1
+        if char not in sentence_endings:
+            continue
+        while index < len(text) and text[index] in closing_quotes:
+            current.append(text[index])
+            index += 1
+        part = "".join(current).strip()
+        if part:
+            sentence_parts.append(part)
+        current = []
+
+    tail = "".join(current).strip()
+    if tail:
+        sentence_parts.append(tail)
+
+    def clause_length(value: str) -> int:
+        return len(value.strip().rstrip("。！？!?；;\n"))
+
+    def split_commas(part: str) -> List[str]:
+        comma_positions = [match.start() for match in re.finditer(r"[，,]", part)]
+        if not comma_positions:
+            return [part]
+
+        split_parts: List[str] = []
+        start = 0
+        for position_index, comma_position in enumerate(comma_positions):
+            next_comma = (
+                comma_positions[position_index + 1]
+                if position_index + 1 < len(comma_positions)
+                else len(part)
+            )
+            before = part[start:comma_position]
+            after = part[comma_position + 1 : next_comma]
+            if (
+                clause_length(before) > _LLM_REPLY_COMMA_SPLIT_MIN_CHARS
+                or clause_length(after) > _LLM_REPLY_COMMA_SPLIT_MIN_CHARS
+            ):
+                current_part = part[start : comma_position + 1].strip()
+                if current_part:
+                    split_parts.append(current_part)
+                start = comma_position + 1
+
+        tail_part = part[start:].strip()
+        if tail_part:
+            split_parts.append(tail_part)
+        return split_parts or [part]
+
+    expanded: List[str] = []
+    for part in sentence_parts or [text]:
+        expanded.extend(split_commas(part))
+
+    if len(expanded) > _LLM_REPLY_MAX_PARTS:
+        expanded = expanded[: _LLM_REPLY_MAX_PARTS - 1] + [
+            "".join(expanded[_LLM_REPLY_MAX_PARTS - 1 :]).strip()
+        ]
+    return expanded
 
 
 def _is_keyword_in_text(
@@ -2100,7 +2189,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             return await self.ctx.llm.generate(
                 prompt=rendered,
                 task_name="replyer",
-                max_tokens=_LLM_MAX_TOKENS,
+                max_tokens=self.config.mute.llm_reply_max_tokens,
             )
 
         try:
@@ -2225,8 +2314,16 @@ class GroupMuterPlugin(MaiBotPlugin):
         group_id: str = "",
         expected_session: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """LLM 生成 + 出站豁免 + 发送，在后台任务中完成。"""
-        reply = (await self._generate_llm_reply(event, fallback, stream_id)) or fallback
+        """LLM 生成 + 断句 + 出站豁免 + 发送，在后台任务中完成。"""
+        generated_reply = await self._generate_llm_reply(event, fallback, stream_id)
+        reply = generated_reply or fallback
+        replies = (
+            _split_llm_reply(reply)
+            if generated_reply and self.config.mute.llm_reply_split_enabled
+            else [reply]
+        )
+        if not replies:
+            replies = [reply]
         if (
             self._unloading
             or self._llm_control_tasks.get(group_id) is not asyncio.current_task()
@@ -2236,8 +2333,10 @@ class GroupMuterPlugin(MaiBotPlugin):
         if group_id and label in ("start_mute", "renew_mute"):
             if self._mute_status.remaining_seconds(group_id) <= 0:
                 return
-            self._mute_status.set_send_exempt(group_id, reply)
-        await self._send_control_message(reply, stream_id, label=label)
+            for part in replies:
+                self._mute_status.set_send_exempt(group_id, part)
+        for part in replies:
+            await self._send_control_message(part, stream_id, label=label)
 
     def _spawn_control_send(self, text: str, stream_id: str, *, label: str) -> None:
         """后台发送控制消息，与入站 hook 的决策返回解耦。
