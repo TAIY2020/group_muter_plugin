@@ -98,6 +98,12 @@ _LLM_CONTEXT_MESSAGE_MAX_CHARS = 500
 # LLM 回复的字符数上限（_sanitize_llm_reply 兜底截断）：
 # 输出直接进群，且出站豁免令牌按文本精确匹配——越短越稳
 _LLM_REPLY_MAX_CHARS = 100
+# 超长时优先在这些句末标点之后截断，避免把一句话切成半截直接发进群
+_LLM_SENTENCE_END_CHARS = frozenset("。！？!?…～~")
+# 句末标点后紧跟的闭合引号/括号一并保留，避免截出不配对的引号
+_LLM_CLOSING_CHARS = frozenset("」』”’\"'）)")
+# 句末截断至少保留的字符数：首句过短时按标点截几乎没内容，退回硬截更接近原意
+_LLM_REPLY_MIN_KEEP_CHARS = _LLM_REPLY_MAX_CHARS // 4
 _LLM_REPLY_MAX_SENTENCE_NUM = 8
 _LLM_REPLY_MAX_PARTS = 3
 
@@ -735,8 +741,29 @@ def _strip_at_prefix(text: str) -> str:
 _LLM_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
 
 
+def _truncate_at_sentence_end(text: str, limit: int, min_keep: int) -> str:
+    """超过 ``limit`` 时在上限内回退到最后一个句末标点处截断。
+
+    硬截 ``text[:limit]`` 常把一句话切成半截直接发进群。这里在前 ``limit`` 个
+    字符里找最后一个句末标点，连同紧跟的闭合引号/括号一并保留；找不到标点、
+    或保留量不足 ``min_keep``（首句过短，按标点截几乎没内容）时退回硬截。
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(char) for char in _LLM_SENTENCE_END_CHARS)
+    if cut < 0:
+        return head
+    end = cut + 1
+    while end < len(head) and head[end] in _LLM_CLOSING_CHARS:
+        end += 1
+    if end < min_keep:
+        return head
+    return head[:end].rstrip()
+
+
 def _sanitize_llm_reply(raw: str) -> str:
-    """LLM 回复的输出兜底清理：剥包裹引号、压成单行、超长截断。
+    """LLM 回复的输出兜底清理：剥包裹引号、压成单行、超长时在句末截断。
 
     提示词已要求"只输出回复正文"，这里是模型不听话时的硬约束——
     输出会原样发进群，且出站豁免令牌按文本精确匹配，输出越短越怪
@@ -753,7 +780,7 @@ def _sanitize_llm_reply(raw: str) -> str:
             break
     else:
         return ""
-    return text[:_LLM_REPLY_MAX_CHARS]
+    return _truncate_at_sentence_end(text, _LLM_REPLY_MAX_CHARS, _LLM_REPLY_MIN_KEEP_CHARS)
 
 
 def _is_english_letter(char: str) -> bool:
@@ -1572,7 +1599,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="stream_id",
                 param_type=ToolParamType.STRING,
-                description="当前聊天流 ID，通常由系统上下文自动注入、一般无需填写；必须是群聊聊天流。",
+                description="留空即可，系统会自动注入当前聊天流；填写的值不会覆盖系统注入的会话。目标必须是群聊聊天流。",
                 required=False,
             ),
             ToolParameterInfo(
@@ -1913,8 +1940,10 @@ class GroupMuterPlugin(MaiBotPlugin):
         """从工具参数与 Host 注入的上下文解析并**核验**目标群聊流。
 
         Host 派发工具调用时会把当前会话的 stream_id / chat_id / group_id 注入参数，
-        但只在模型没填或填空时才补——模型填了非空错值不会被覆盖。因此参数里的
-        group_id 与 stream_id 不一定指向同一个群，这里不直接信任它们的组合：
+        但只在模型没填或填空时才补——模型填了非空错值不会被覆盖。其中 chat_id
+        不在工具 schema 里、模型不会填，恒为 Host 注入的当前会话流，是唯一不受
+        模型参数左右的流标识，故优先采用；声明参数 stream_id 仅作回退。即便如此，
+        参数里的 group_id 与流不一定指向同一个群，这里不直接信任它们的组合：
 
         * 已在静音中的流：tracker 里的 stream → group 映射来自上一次核验，直接复用；
         * 其它：按 stream_id 反查 Host 的真实群聊流，命中才认；未命中（流不存在
@@ -1922,15 +1951,21 @@ class GroupMuterPlugin(MaiBotPlugin):
         * 参数里带了 group_id 却与反查结果不一致（模型把别的群的 stream_id 填进了
           当前群的调用）→ 同样返回空 group_id 拒绝，避免 A 群记静音、B 流被调频。
         """
+        declared_sid = str(stream_id or kwargs.get("stream_id") or "").strip()
         sid = str(
-            stream_id
-            or kwargs.get("stream_id")
-            or kwargs.get("chat_id")
+            kwargs.get("chat_id")
+            or declared_sid
             or kwargs.get("session_id")
             or ""
         ).strip()
         if not sid:
             return MessageContext()
+        if declared_sid and declared_sid != sid:
+            # 模型往声明参数里填了与当前会话不同的流：不采用，只记日志便于排查。
+            logger.warning(
+                "[mute_guard] 主动沉默参数 stream_id=%s 与 Host 注入的 chat_id=%s 不一致，按 chat_id 执行",
+                declared_sid, sid,
+            )
         claimed_group_id = str(kwargs.get("group_id") or "").strip()
 
         group_id = self._mute_status.group_for_stream(sid)
@@ -2052,6 +2087,17 @@ class GroupMuterPlugin(MaiBotPlugin):
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=0.25)
         except asyncio.TimeoutError:
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 任务内部已把全部 RPC try 住，这里兜的是残余的意外异常。若放它逃进
+            # hook，ErrorPolicy.SKIP 会丢弃本 handler 的返回值（abort 丢失）、消息
+            # 静默放行——对拦截路径是 fail-open。统一按"窥屏不可用"退回入站拦截。
+            logger.warning(
+                "[mute_guard] 进入纯窥屏时发生意外异常，退回入站拦截 (stream=%s)",
+                stream_id, exc_info=True,
+            )
             return False
 
     def _frequency_entry_allowed(self, stream_id: str, group_id: str = "") -> bool:
@@ -2233,6 +2279,16 @@ class GroupMuterPlugin(MaiBotPlugin):
             await asyncio.wait_for(asyncio.shield(task), timeout=0.25)
         except asyncio.TimeoutError:
             pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 恢复任务内部已自行记录失败；这里兜的是逃出任务的意外异常。若让它
+            # 传进 hook，ErrorPolicy.SKIP 会丢掉调用方的 abort——解除指令本身会
+            # 漏进主链。恢复值仍保留在 _frequency_restore_values，下次重试。
+            logger.warning(
+                "[mute_guard] 等待恢复发言频率时发生意外异常 (stream=%s)",
+                stream_id, exc_info=True,
+            )
 
     async def _restore_frequency_serialized(self, stream_id: str) -> None:
         """恢复因纯窥屏模式临时覆盖的发言频率调整值。
