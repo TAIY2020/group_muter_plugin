@@ -79,7 +79,7 @@ _PEEK_FREQUENCY_EPSILON = 1e-6
 
 # LLM 动态回复
 
-_LLM_DEFAULT_REPLY_PROMPT = "根据麦麦的全局人设和回复风格，以及以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n全局人设：{personality}\n全局回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}"
+_LLM_DEFAULT_REPLY_PROMPT = "{personality}\n根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}"
 
 _LLM_EVENT_LABELS = {
     "start_mute": "管理员要求你在群聊中静音",
@@ -87,6 +87,7 @@ _LLM_EVENT_LABELS = {
     "end_mute": "管理员解除了你在群聊中的静音",
     "refuse_start": "非管理员试图让你静音但被拒绝",
 }
+_SILENCE_TOOL_COMPONENT_NAME = "TAIY2020.group-muter-plugin.silence"
 
 _LLM_GENERATE_TIMEOUT = 30
 # 一两句话的短回复绰绰有余；模型不听话输出长文时靠它硬截断，
@@ -1410,6 +1411,7 @@ class GroupMuterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._admin_roster.refresh(self.config.user_control)
+        await self._sync_silence_tool_state()
         if self.config.mute.persist_sessions:
             await self._init_session_persistence()
         logger.info("群聊静音插件(v%s)初始化完成。", PLUGIN_VERSION)
@@ -1581,6 +1583,7 @@ class GroupMuterPlugin(MaiBotPlugin):
         """配置热重载回调。"""
         if scope == "self":
             self._admin_roster.refresh(self.config.user_control)
+            await self._sync_silence_tool_state()
             if not self.config.mute.learn_while_muted:
                 await self._restore_all_frequency_adjustments()
             # 持久化开关热切换：关→停止接收并排空在途写入；开→补初始化。
@@ -1592,6 +1595,39 @@ class GroupMuterPlugin(MaiBotPlugin):
                     await self._drain_session_writes()
                 elif not self._session_file and not self._unloading:
                     await self._init_session_persistence(restore=False)
+
+    async def _sync_silence_tool_state(self) -> None:
+        """让 Planner 中 silence 工具的可用状态跟随配置开关。"""
+        enabled = self.config.tool.enabled
+        try:
+            if enabled:
+                result = await self.ctx.component.enable_component(
+                    _SILENCE_TOOL_COMPONENT_NAME,
+                    "TOOL",
+                    scope="global",
+                )
+            else:
+                result = await self.ctx.component.disable_component(
+                    _SILENCE_TOOL_COMPONENT_NAME,
+                    "TOOL",
+                    scope="global",
+                )
+            if result is False or (
+                isinstance(result, dict) and result.get("success") is False
+            ):
+                logger.warning(
+                    "[mute_guard] 同步 silence 工具状态失败 (enabled=%s): %s",
+                    enabled,
+                    result.get("error", result) if isinstance(result, dict) else result,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[mute_guard] 同步 silence 工具状态失败 (enabled=%s)",
+                enabled,
+                exc_info=True,
+            )
 
     @Tool(
         "silence",
@@ -2387,19 +2423,17 @@ class GroupMuterPlugin(MaiBotPlugin):
             context_text = ""
             if self.config.mute.llm_reply_use_context and stream_id:
                 context_text = await self._fetch_recent_context(stream_id)
+            personality, reply_style = await asyncio.gather(
+                self.ctx.config.get("personality.personality", ""),
+                self.ctx.config.get("personality.reply_style", ""),
+            )
             rendered = (
                 self.config.mute.llm_reply_prompt
                 .replace("{event}", _LLM_EVENT_LABELS.get(event, event))
                 .replace("{fallback}", fallback)
                 .replace("{context}", context_text)
-                .replace(
-                    "{personality}",
-                    str(self.ctx.config.get("personality.personality", "") or ""),
-                )
-                .replace(
-                    "{reply_style}",
-                    str(self.ctx.config.get("personality.reply_style", "") or ""),
-                )
+                .replace("{personality}", str(personality or ""))
+                .replace("{reply_style}", str(reply_style or ""))
             )
             return await self.ctx.llm.generate(
                 prompt=rendered,
@@ -2603,11 +2637,11 @@ class GroupMuterPlugin(MaiBotPlugin):
         context: MessageContext,
         label: str,
     ) -> None:
-        """把被入站 Hook 消费的静音控制词补入 Maisaka 用户上下文。"""
+        """将静音控制事件说明写入 Maisaka 用户上下文。"""
         if not self.config.mute.maisaka_context_sync_enabled or not context.stream_id:
             return
 
-        text = context.plain_text.strip() or _LLM_EVENT_LABELS.get(label, "静音控制指令")
+        text = _LLM_EVENT_LABELS.get(label, "静音控制指令")
         try:
             result = await asyncio.wait_for(
                 self.ctx.maisaka.context.append(

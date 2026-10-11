@@ -66,7 +66,7 @@
 
 ### 主动沉默（silence 工具）
 
-插件会向 MaiBot 注册 `silence` Tool。麦麦可以在以下场景自主调用：
+`tool.enabled` 开启时，插件会向 MaiBot 注册并启用 `silence` Tool；关闭时会从 Planner 的可用工具集中禁用。配置热更新会同步开关状态。麦麦可以在以下场景自主调用：
 
 - 觉得自己话太多，应该暂时少参与讨论。
 - 群聊气氛不适合继续插话。
@@ -129,11 +129,11 @@
 
 - **启用后**：开启静音、续期、解除、拒绝权限四类回复使用 LLM 生成动态文案。
 - **关闭时**：完全沿用现有固定回复，不调用 LLM 或消息历史接口。
-- **提示词模板**：默认模板包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）、`{context}`（最近消息，需开启群聊上下文）、`{personality}`（麦麦全局人设）和 `{reply_style}`（麦麦全局回复风格）占位符，可通过 `mute.llm_reply_prompt` 自定义。后两项分别读取 MaiBot 全局配置 `personality.personality` 和 `personality.reply_style`。
+- **提示词模板**：默认模板先插入 `{personality}`（麦麦全局人设），再给出回复要求，并以“回复风格：`{reply_style}`”提供麦麦全局回复风格；随后包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）和 `{context}`（最近消息，需开启群聊上下文）。可通过 `mute.llm_reply_prompt` 自定义；人设和回复风格分别读取 MaiBot 全局配置 `personality.personality` 和 `personality.reply_style`。
 - **任务路由**：通过 `task_name="replyer"` 使用 Host 的 replyer 任务，而不是指定一个叫 replyer 的具体模型。
 - **超时与 fallback**：历史读取和 LLM 生成共享 30 秒总预算，超时、异常或返回空文本时自动回退到对应的固定回复。
 - **过时回复**：同群只保留最新动态控制回复，发送前核对会话快照；解除、续期或过期后，旧生成结果不会重新发送。取消插件等待不代表远端模型请求一定停止计费。
-- **Maisaka 上下文**：由 `mute.maisaka_context_sync_enabled` 控制，默认开启。开启时，进入、续期和退出静音的触发消息会写入上下文，成功发送的固定回复和 LLM 回复也会同步写入；关闭后两类同步都会跳过。
+- **Maisaka 上下文**：由 `mute.maisaka_context_sync_enabled` 控制，默认开启。开启时，进入、续期和退出静音对应的事件说明会写入上下文，成功发送的固定回复和 LLM 回复也会同步写入；关闭后两类同步都会跳过。
 - **输出约束**：LLM 输出会做兜底清理——剥去包裹引号、多行只取第一个非空行、超过 100 字符时在上限内回退到最后一个句末标点处截断（找不到标点或首句过短则硬截）；清理后为空则回退固定回复。
 - **断句开关**：`mute.llm_reply_split_enabled` 默认开启；使用 MaiBot 规则分割器处理换行、引号、冒号、逗号、句号、英文分号和空格，并按主程序规则概率性合并；最多保留 8 个句段，最终最多发送 3 条，超过句段上限时回退固定回复。关闭后恢复为单条消息发送。
 - **上下文**：最多读取 10 条群聊消息，每条正文最多 500 字符，上下文总计最多 3000 字符；昵称最多 80 字符。读取失败不阻断生成，仍以无上下文方式继续。
@@ -156,7 +156,7 @@
 | `mute.persist_sessions` | bool | `true` | 持久化静音会话，重启/重载恢复未到期会话 |
 | `mute.maisaka_context_sync_enabled` | bool | `true` | 是否将静音控制词和本插件回复同步到 Maisaka 上下文 |
 | `mute.llm_reply_enabled` | bool | `false` | 是否使用 LLM 动态生成回复文案（关闭时使用各固定回复字段） |
-| `mute.llm_reply_prompt` | str | `根据麦麦的全局人设和回复风格...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` `{personality}` `{reply_style}` 占位符 |
+| `mute.llm_reply_prompt` | str | `{personality}\n根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` `{personality}` `{reply_style}` 占位符 |
 | `mute.llm_reply_use_context` | bool | `false` | LLM 生成回复时是否读取最近 10 条群聊消息作为上下文 |
 | `mute.llm_reply_split_enabled` | bool | `true` | 是否将 LLM 动态回复按规则拆分后分多条发送 |
 | `mute.llm_reply_max_tokens` | int | `200` | LLM 生成回复的最大 token 数，必须大于等于 1；开启思考时可适当调大 |
@@ -164,7 +164,7 @@
 | `user_control.list` | list | `[]` | 拥有静音操作权限的 QQ 号列表（字符串，如 `["123456"]`） |
 | `user_control.authorization_mode` | str | `list` | `list` 使用名单；`group_admin` 使用 QQ 群角色；`list_or_group_admin` 任一满足即授权 |
 | `user_control.role_cache_seconds` | int | `30` | QQ 群角色缓存秒数，范围 0 ~ 300，0 表示每次重新查询 |
-| `tool.enabled` | bool | `true` | 是否允许麦麦通过 `silence` 工具主动进入沉默 |
+| `tool.enabled` | bool | `true` | 是否向 Planner 暴露 `silence` 工具并允许主动进入沉默；热更新时同步启用状态 |
 | `tool.require_admin` | bool | `false` | 当前 Host 无可信工具身份契约，开启后拒绝主动沉默工具，请改用管理员关键词 |
 | `tool.default_duration_seconds` | int | `600` | 工具未指定时长时的默认沉默时间（秒） |
 | `tool.max_duration_seconds` | int | `10800` | 工具可主动沉默的最大时长（秒） |
