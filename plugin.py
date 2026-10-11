@@ -23,6 +23,7 @@ from pydantic import field_validator, model_validator
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 import json
@@ -97,8 +98,8 @@ _LLM_CONTEXT_MESSAGE_MAX_CHARS = 500
 # LLM 回复的字符数上限（_sanitize_llm_reply 兜底截断）：
 # 输出直接进群，且出站豁免令牌按文本精确匹配——越短越稳
 _LLM_REPLY_MAX_CHARS = 100
-_LLM_REPLY_MAX_PARTS = 5
-_LLM_REPLY_COMMA_SPLIT_MIN_CHARS = 8
+_LLM_REPLY_MAX_SENTENCE_NUM = 8
+_LLM_REPLY_MAX_PARTS = 3
 
 
 # --- 配置模型 ---
@@ -755,80 +756,223 @@ def _sanitize_llm_reply(raw: str) -> str:
     return text[:_LLM_REPLY_MAX_CHARS]
 
 
-def _split_llm_reply(text: str) -> List[str]:
-    """按 MaiBot 规则断句的主要边界拆分动态回复。
+def _is_english_letter(char: str) -> bool:
+    """判断字符是否为英文字母。"""
+    return "a" <= char.lower() <= "z"
 
-    句末标点会直接断开；逗号只有在逗号前或逗号后的片段超过八个字符时
-    才作为分隔点，避免很短的口语片段被拆得过碎。
+
+def _split_into_sentence_segments(text: str) -> List[tuple[str, str]]:
+    """复制 MaiBot 规则断句器，返回 (句子内容, 尾随分隔符)。
+
+    该实现与 MaiBot ``src.chat.utils.utils`` 中的规则分割器保持一致：
+    先规范换行，再识别逗号、句号、分号、空格和换行分隔符；
+    引号内部不分割，冒号两侧和英文/数字中间的空格也不分割；
+    最后按原文长度概率性合并相邻片段。
     """
-    text = text.strip()
-    if not text:
-        return []
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    text = re.sub(r"\n\s*([，,。;\s])", r"\n\1", text)
+    text = re.sub(r"([，,。;\s])\s*\n", r"\1\n", text)
 
-    sentence_endings = set("。！？!?；;.\n")
-    closing_quotes = set("\"'”’」』】》）)]")
-    sentence_parts: List[str] = []
-    current: List[str] = []
+    len_text = len(text)
+    if len_text < 3:
+        if random.random() < 0.01:
+            return [(char, "") for char in text]
+        return [(text, "")]
+
+    quote_chars = {
+        '"',
+        "'",
+        "“",
+        "”",
+        "‘",
+        "’",
+        "「",
+        "」",
+        "『",
+        "』",
+    }
+    inside_quote = [False] * len_text
+    in_quote = False
+    current_quote_char = ""
+    for index, char in enumerate(text):
+        if char in quote_chars:
+            if not in_quote:
+                in_quote = True
+                current_quote_char = char
+                inside_quote[index] = False
+            else:
+                if char == current_quote_char or (
+                    char in {'"', "'"} and current_quote_char in {'"', "'"}
+                ):
+                    in_quote = False
+                    current_quote_char = ""
+                inside_quote[index] = False
+        else:
+            inside_quote[index] = in_quote
+
+    separators = {"，", ",", " ", "。", ";", "\n"}
+    segments: List[tuple[str, str]] = []
+    current_segment = ""
+
     index = 0
     while index < len(text):
         char = text[index]
-        current.append(char)
+        if char in separators:
+            if inside_quote[index]:
+                can_split = False
+            elif char == "\n":
+                can_split = True
+            else:
+                can_split = True
+                if index > 0 and text[index - 1] in {":", "："}:
+                    can_split = False
+                if index < len(text) - 1 and text[index + 1] in {":", "："}:
+                    can_split = False
+
+                if can_split and char == " " and 0 < index < len(text) - 1:
+                    prev_char = text[index - 1]
+                    next_char = text[index + 1]
+                    if prev_char in {"-", "—"} or next_char in {"-", "—"}:
+                        can_split = False
+                    else:
+                        prev_is_alnum = prev_char.isdigit() or _is_english_letter(prev_char)
+                        next_is_alnum = next_char.isdigit() or _is_english_letter(next_char)
+                        if prev_is_alnum and next_is_alnum:
+                            can_split = False
+
+            if can_split:
+                if current_segment:
+                    segments.append((current_segment, char))
+                elif char in {" ", "\n"}:
+                    segments.append(("", char))
+                current_segment = ""
+            else:
+                current_segment += char
+        else:
+            current_segment += char
         index += 1
-        if char not in sentence_endings:
-            continue
-        while index < len(text) and text[index] in closing_quotes:
-            current.append(text[index])
+
+    if current_segment:
+        segments.append((current_segment, ""))
+
+    segments = [(content, separator) for content, separator in segments if content or separator]
+    if not segments:
+        return [(text, "")] if text else []
+
+    if len_text < 12:
+        split_strength = 0.2
+    elif len_text < 32:
+        split_strength = 0.6
+    else:
+        split_strength = 0.7
+    merge_probability = 1.0 - split_strength
+
+    merged_segments: List[tuple[str, str]] = []
+    index = 0
+    while index < len(segments):
+        current_content, current_separator = segments[index]
+        if (
+            index + 1 < len(segments)
+            and current_content
+            and current_separator != "\n"
+            and random.random() < merge_probability
+        ):
+            next_content, next_separator = segments[index + 1]
+            if next_content:
+                merged_segments.append(
+                    (current_content + current_separator + next_content, next_separator)
+                )
+            else:
+                merged_segments.append((current_content, next_separator))
+            index += 2
+        else:
+            merged_segments.append((current_content, current_separator))
             index += 1
-        part = "".join(current).strip()
-        if part:
-            sentence_parts.append(part)
-        current = []
 
-    tail = "".join(current).strip()
-    if tail:
-        sentence_parts.append(tail)
+    sentence_segments = [
+        (content, separator)
+        for content, separator in merged_segments
+        if content and content.strip()
+    ]
+    sentence_segments = [
+        (normalized_sentence, separator)
+        for sentence, separator in sentence_segments
+        if (
+            normalized_sentence := re.sub(
+                r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", sentence
+            ).strip()
+        )
+    ]
 
-    def clause_length(value: str) -> int:
-        return len(value.strip().rstrip("。！？!?；;\n"))
+    logger.debug(
+        "LLM 回复规则断句结果: %s",
+        [sentence for sentence, _separator in sentence_segments],
+    )
+    return sentence_segments
 
-    def split_commas(part: str) -> List[str]:
-        comma_positions = [match.start() for match in re.finditer(r"[，,]", part)]
-        if not comma_positions:
-            return [part]
 
-        split_parts: List[str] = []
-        start = 0
-        for position_index, comma_position in enumerate(comma_positions):
-            next_comma = (
-                comma_positions[position_index + 1]
-                if position_index + 1 < len(comma_positions)
-                else len(part)
-            )
-            before = part[start:comma_position]
-            after = part[comma_position + 1 : next_comma]
-            if (
-                clause_length(before) > _LLM_REPLY_COMMA_SPLIT_MIN_CHARS
-                or clause_length(after) > _LLM_REPLY_COMMA_SPLIT_MIN_CHARS
-            ):
-                current_part = part[start : comma_position + 1].strip()
-                if current_part:
-                    split_parts.append(current_part)
-                start = comma_position + 1
+def _merge_sentence_segments_to_max_count(
+    segments: List[tuple[str, str]],
+    max_count: int,
+) -> List[tuple[str, str]]:
+    """按 MaiBot 的均匀分组策略压缩消息条数，并恢复组内分隔符。"""
+    if len(segments) <= max_count:
+        return segments
+    if max_count <= 0:
+        return []
 
-        tail_part = part[start:].strip()
-        if tail_part:
-            split_parts.append(tail_part)
-        return split_parts or [part]
+    segment_count = len(segments)
+    group_starts = {0}
+    evenly_spaced_starts: List[int] = []
+    start_index = 0
+    for group_index in range(max_count):
+        remaining_segments = segment_count - start_index
+        remaining_groups = max_count - group_index
+        group_size = (remaining_segments + remaining_groups - 1) // remaining_groups
+        evenly_spaced_starts.append(start_index)
+        start_index += group_size
 
-    expanded: List[str] = []
-    for part in sentence_parts or [text]:
-        expanded.extend(split_commas(part))
+    for candidate_start in evenly_spaced_starts:
+        if len(group_starts) >= max_count:
+            break
+        group_starts.add(candidate_start)
 
-    if len(expanded) > _LLM_REPLY_MAX_PARTS:
-        expanded = expanded[: _LLM_REPLY_MAX_PARTS - 1] + [
-            "".join(expanded[_LLM_REPLY_MAX_PARTS - 1 :]).strip()
-        ]
-    return expanded
+    sorted_starts = sorted(group_starts)
+    merged_segments: List[tuple[str, str]] = []
+    for group_index, group_start in enumerate(sorted_starts):
+        group_end = (
+            sorted_starts[group_index + 1]
+            if group_index + 1 < len(sorted_starts)
+            else segment_count
+        )
+        group = segments[group_start:group_end]
+        merged_text_parts: List[str] = []
+        for position, (content, separator) in enumerate(group):
+            merged_text_parts.append(content)
+            if position < len(group) - 1:
+                merged_text_parts.append(separator)
+        merged_segments.append(("".join(merged_text_parts), group[-1][1]))
+    return merged_segments
+
+
+def _split_llm_reply(text: str, overflow_reply: str) -> List[str]:
+    """使用 MaiBot 官方规则断句器处理 LLM 回复。"""
+    if not text:
+        return []
+
+    sentence_segments = _split_into_sentence_segments(text)
+    if len(sentence_segments) > _LLM_REPLY_MAX_SENTENCE_NUM:
+        logger.warning(
+            "LLM 回复规则断句后超过最大句段数 (%s)，回退固定回复",
+            _LLM_REPLY_MAX_SENTENCE_NUM,
+        )
+        return [overflow_reply]
+
+    sentence_segments = _merge_sentence_segments_to_max_count(
+        sentence_segments,
+        _LLM_REPLY_MAX_PARTS,
+    )
+    return [sentence for sentence, _separator in sentence_segments if sentence.strip()]
 
 
 def _is_keyword_in_text(
@@ -2318,7 +2462,7 @@ class GroupMuterPlugin(MaiBotPlugin):
         generated_reply = await self._generate_llm_reply(event, fallback, stream_id)
         reply = generated_reply or fallback
         replies = (
-            _split_llm_reply(reply)
+            _split_llm_reply(reply, fallback)
             if generated_reply and self.config.mute.llm_reply_split_enabled
             else [reply]
         )
