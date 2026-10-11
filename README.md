@@ -157,6 +157,7 @@
 | `mute.llm_reply_prompt` | str | `根据以下事件和群聊语气...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` 占位符 |
 | `mute.llm_reply_use_context` | bool | `false` | LLM 生成回复时是否读取最近 10 条群聊消息作为上下文 |
 | `mute.llm_reply_split_enabled` | bool | `true` | 是否将 LLM 动态回复按规则拆分后分多条发送 |
+| `mute.llm_reply_max_tokens` | int | `200` | LLM 生成回复的最大 token 数，必须大于等于 1；开启思考时可适当调大 |
 | `user_control.list_type` | str | `whitelist` | 权限模式：`whitelist` 仅名单内可操作；`blacklist` 名单外可操作（空名单 = 全员可操作） |
 | `user_control.list` | list | `[]` | 拥有静音操作权限的 QQ 号列表（字符串，如 `["123456"]`） |
 | `user_control.authorization_mode` | str | `list` | `list` 使用名单；`group_admin` 使用 QQ 群角色；`list_or_group_admin` 任一满足即授权 |
