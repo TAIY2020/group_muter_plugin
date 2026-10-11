@@ -2,12 +2,13 @@
 
 允许管理员通过聊天命令，让麦麦在指定群聊中临时进入“静音状态”。
 静音期间默认会让麦麦以发言频率 0 纯窥屏；关闭该功能时才会入站拦截所有群消息。
-管理员可通过关键词指令或 @麦麦 解除静音。
+管理员可通过关键词指令、/muteon、/muteoff 或 @麦麦解除静音。
 
 实现方案：
     1. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook。
        此 Hook 在消息预处理完成后、Command 匹配之前触发，
-       控制指令会通过返回 {"action": "abort"} 消费；普通消息在纯窥屏模式下放行。
+       关键词控制指令，以及开关启用时的 /muteon、/muteoff，会通过返回
+       {"action": "abort"} 消费；普通消息在纯窥屏模式下放行。
     2. 主动沉默：注册 silence Tool，允许麦麦自主决定进入指定时长的沉默。
     3. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
        此 Hook 在消息即将发送前触发，用于拦截静音前已进入思考流程、
@@ -60,6 +61,8 @@ CONFIG_SCHEMA_VERSION = "2.4.0"
 # Host 把 at 段重渲染为 "@群名片"/"@昵称"（SessionMessage.process_at_component），
 # 两个适配器都不产 CQ 码，这里不再匹配 [CQ:at,...]。
 _AT_PREFIX_PATTERN = re.compile(r"@\S+")
+_MUTE_ON_COMMAND = "/muteon"
+_MUTE_OFF_COMMAND = "/muteoff"
 
 # 窥屏确认后的周期复核：runtime 被 Host 重建（清空上下文指令 / LRU 淘汰）后调整值
 # 回到 1.0，插件的 _peek_confirmed 快速路径却不再 set_adjust。摘要循环每轮对已确认
@@ -161,6 +164,11 @@ class MuteSection(PluginConfigBase):
         default=["Mute False", "安安别看了"],
         description="解除静音的关键词列表",
         json_schema_extra={"label": "解除关键词", "hint": "管理员发送这些词时解除静音"},
+    )
+    enable_slash_commands: bool = Field(
+        default=True,
+        description="是否启用内置 /muteon 和 /muteoff 命令",
+        json_schema_extra={"label": "启用斜杠命令"},
     )
     enable_unmute: bool = Field(
         default=True,
@@ -743,6 +751,23 @@ def _strip_at_prefix(text: str) -> str:
     return _AT_PREFIX_PATTERN.sub("", text).strip()
 
 
+def _is_builtin_mute_command(
+    text: str,
+    command: str,
+    *,
+    allow_at_prefix: bool = False,
+) -> bool:
+    """判断文本（去除 @前缀后）是否为精确的内置斜杠命令。"""
+    normalized = text.strip()
+    if normalized == command:
+        return True
+    return (
+        allow_at_prefix
+        and normalized.startswith("@")
+        and _strip_at_prefix(normalized) == command
+    )
+
+
 # 模型"不听话"时常见的包裹引号对：左引号 → 对应右引号
 _LLM_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
 
@@ -1047,7 +1072,8 @@ class MessageContext:
     """从序列化的 SessionMessage 字典提取的关键字段集合（入站/出站共用）。
 
     "如何从 message dict 挖字段"的知识单点集中在 ``from_message``；
-    出站消息缺少 plain_text / user_id 等字段时安全回退为空串，调用方按需读取。
+    出站消息缺少 plain_text / user_id / user_name 等字段时安全回退为空串，
+    调用方按需读取。
 
     ``is_bot_mentioned`` 依赖 adapter 在入站时正确设置 ``is_at`` / ``is_mentioned``，
     语义为"@ 到 bot 自己"。napcat adapter 已实现该契约（仅当
@@ -1064,6 +1090,7 @@ class MessageContext:
     user_id: str = ""
     is_bot_mentioned: bool = False
     platform: str = ""
+    user_name: str = ""
 
     @classmethod
     def from_message(cls, message: Optional[dict]) -> "MessageContext":
@@ -1095,6 +1122,11 @@ class MessageContext:
             # 消息顶层，message_info 内只有 user_info / group_info / additional_config；
             # 保留 message_info 回退仅为容忍其它来源的消息形态。
             platform=str(message.get("platform") or msg_info.get("platform") or ""),
+            user_name=str(
+                user_info.get("user_cardname")
+                or user_info.get("user_nickname")
+                or ""
+            ).strip()[:80],
         )
 
 
@@ -1271,13 +1303,30 @@ class MuteIntentResolver:
         if not context.group_id:
             return MuteIntent(kind="pass_through")
 
+        mute_on_command = (
+            mute_config.enable_slash_commands
+            and _is_builtin_mute_command(
+                context.plain_text,
+                _MUTE_ON_COMMAND,
+                allow_at_prefix=context.is_bot_mentioned,
+            )
+        )
+        mute_off_command = (
+            mute_config.enable_slash_commands
+            and _is_builtin_mute_command(
+                context.plain_text,
+                _MUTE_OFF_COMMAND,
+                allow_at_prefix=context.is_bot_mentioned,
+            )
+        )
+
         # --- 未静音 ---
         if not muted:
             if _is_keyword_in_text(
                 context.plain_text,
                 mute_config.mute_keywords,
                 allow_at_suffix_match=context.is_bot_mentioned,
-            ):
+            ) or mute_on_command:
                 if is_admin:
                     return MuteIntent(
                         kind="start_mute",
@@ -1300,11 +1349,16 @@ class MuteIntentResolver:
         # 任何关键词"才走 @ 解除。
         if (
             is_admin
-            and mute_config.enable_unmute
-            and _is_keyword_in_text(
-                context.plain_text,
-                mute_config.unmute_keywords,
-                allow_at_suffix_match=context.is_bot_mentioned,
+            and (
+                mute_off_command
+                or (
+                    mute_config.enable_unmute
+                    and _is_keyword_in_text(
+                        context.plain_text,
+                        mute_config.unmute_keywords,
+                        allow_at_suffix_match=context.is_bot_mentioned,
+                    )
+                )
             )
         ):
             return MuteIntent(
@@ -1312,10 +1366,13 @@ class MuteIntentResolver:
                 group_id=context.group_id,
                 stream_id=context.stream_id,
             )
-        if is_admin and _is_keyword_in_text(
-            context.plain_text,
-            mute_config.mute_keywords,
-            allow_at_suffix_match=context.is_bot_mentioned,
+        if is_admin and (
+            mute_on_command
+            or _is_keyword_in_text(
+                context.plain_text,
+                mute_config.mute_keywords,
+                allow_at_suffix_match=context.is_bot_mentioned,
+            )
         ):
             # 静音中管理员再发静音关键词 → 续期（重置计时），不再静默吞掉
             return MuteIntent(
@@ -1364,7 +1421,6 @@ class GroupMuterPlugin(MaiBotPlugin):
 
     使用 @HookHandler 订阅 chat.receive.after_process Hook，
     在消息预处理完成后、Command 匹配之前拦截静音群的消息。
-    不使用任何 @Command，不会影响其他插件的命令匹配。
     """
 
     config_model = GroupMuterConfig
@@ -2641,7 +2697,18 @@ class GroupMuterPlugin(MaiBotPlugin):
         if not self.config.mute.maisaka_context_sync_enabled or not context.stream_id:
             return
 
-        text = _LLM_EVENT_LABELS.get(label, "静音控制指令")
+        event_text = _LLM_EVENT_LABELS.get(label, "静音控制指令")
+        user_name = context.user_name.strip()
+        user_id = context.user_id.strip()
+        if user_name and user_id:
+            actor = f"{user_name}（用户标识：{user_id}）"
+        elif user_name:
+            actor = user_name
+        elif user_id:
+            actor = f"用户标识：{user_id}"
+        else:
+            actor = "未知用户"
+        text = f"{actor} 执行了静音控制：{event_text}"
         try:
             result = await asyncio.wait_for(
                 self.ctx.maisaka.context.append(
