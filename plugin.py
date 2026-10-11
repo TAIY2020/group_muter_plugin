@@ -79,7 +79,7 @@ _PEEK_FREQUENCY_EPSILON = 1e-6
 
 # LLM 动态回复
 
-_LLM_DEFAULT_REPLY_PROMPT = "根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n事件：{event}\n固定回复参考：{fallback}\n{context}"
+_LLM_DEFAULT_REPLY_PROMPT = "根据麦麦的全局人设和回复风格，以及以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n全局人设：{personality}\n全局回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}"
 
 _LLM_EVENT_LABELS = {
     "start_mute": "管理员要求你在群聊中静音",
@@ -207,6 +207,11 @@ class MuteSection(PluginConfigBase):
             "hint": "关闭则保持旧行为：重启后静音状态丢失，需重新发送关键词。",
         },
     )
+    maisaka_context_sync_enabled: bool = Field(
+        default=True,
+        description="是否将静音控制词和本插件发送的回复同步到 Maisaka 上下文",
+        json_schema_extra={"label": "同步 Maisaka 上下文"},
+    )
     llm_reply_enabled: bool = Field(
         default=False,
         description="是否使用 LLM 动态生成回复文案（默认关闭，关闭时使用固定回复）",
@@ -214,7 +219,7 @@ class MuteSection(PluginConfigBase):
     )
     llm_reply_prompt: str = Field(
         default=_LLM_DEFAULT_REPLY_PROMPT,
-        description="LLM 生成回复的提示词模板，支持 {event} {fallback} {context} 占位符",
+        description="LLM 生成回复的提示词模板，支持 {event} {fallback} {context} {personality} {reply_style} 占位符",
         json_schema_extra={"label": "LLM 提示词模板"},
     )
     llm_reply_use_context: bool = Field(
@@ -1722,6 +1727,8 @@ class GroupMuterPlugin(MaiBotPlugin):
             is_admin=is_admin,
             mute_config=self.config.mute,
         )
+        if intent.kind in ("start_mute", "renew_mute", "end_mute"):
+            await self._append_control_trigger_to_maisaka(context, intent.kind)
         return await self._dispatch_intent(intent)
 
     async def _dispatch_intent(self, intent: MuteIntent) -> Optional[Dict[str, Any]]:
@@ -2385,6 +2392,14 @@ class GroupMuterPlugin(MaiBotPlugin):
                 .replace("{event}", _LLM_EVENT_LABELS.get(event, event))
                 .replace("{fallback}", fallback)
                 .replace("{context}", context_text)
+                .replace(
+                    "{personality}",
+                    str(self.ctx.config.get("personality.personality", "") or ""),
+                )
+                .replace(
+                    "{reply_style}",
+                    str(self.ctx.config.get("personality.reply_style", "") or ""),
+                )
             )
             return await self.ctx.llm.generate(
                 prompt=rendered,
@@ -2556,7 +2571,13 @@ class GroupMuterPlugin(MaiBotPlugin):
         显式检查 sent，不能把非空的失败详情字典当成发送成功。
         """
         try:
-            result = await self.ctx.send.text(text, stream_id, return_details=True)
+            result = await self.ctx.send.text(
+                text,
+                stream_id,
+                return_details=True,
+                sync_to_maisaka_history=self.config.mute.maisaka_context_sync_enabled,
+                maisaka_source_kind=f"plugin:TAIY2020.group-muter-plugin:{label}",
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2575,6 +2596,43 @@ class GroupMuterPlugin(MaiBotPlugin):
             logger.debug(
                 "[mute_guard] %s 控制消息已投递 (stream=%s, message_id=%s)",
                 label, stream_id, result.get("message_id"),
+            )
+
+    async def _append_control_trigger_to_maisaka(
+        self,
+        context: MessageContext,
+        label: str,
+    ) -> None:
+        """把被入站 Hook 消费的静音控制词补入 Maisaka 用户上下文。"""
+        if not self.config.mute.maisaka_context_sync_enabled or not context.stream_id:
+            return
+
+        text = context.plain_text.strip() or _LLM_EVENT_LABELS.get(label, "静音控制指令")
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.maisaka.context.append(
+                    stream_id=context.stream_id,
+                    segments=[{"type": "text", "content": text}],
+                    visible_text=text,
+                    source_kind=f"plugin:TAIY2020.group-muter-plugin:{label}",
+                ),
+                timeout=1.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[mute_guard] 记录 Maisaka 控制指令上下文失败 (stream=%s)",
+                context.stream_id,
+                exc_info=True,
+            )
+            return
+
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning(
+                "[mute_guard] 记录 Maisaka 控制指令上下文失败 (stream=%s): %s",
+                context.stream_id,
+                result.get("error", "未知错误"),
             )
 
 

@@ -129,10 +129,11 @@
 
 - **启用后**：开启静音、续期、解除、拒绝权限四类回复使用 LLM 生成动态文案。
 - **关闭时**：完全沿用现有固定回复，不调用 LLM 或消息历史接口。
-- **提示词模板**：默认模板包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）、`{context}`（最近消息，需开启上下文）三个占位符，可通过 `mute.llm_reply_prompt` 自定义。
+- **提示词模板**：默认模板包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）、`{context}`（最近消息，需开启群聊上下文）、`{personality}`（麦麦全局人设）和 `{reply_style}`（麦麦全局回复风格）占位符，可通过 `mute.llm_reply_prompt` 自定义。后两项分别读取 MaiBot 全局配置 `personality.personality` 和 `personality.reply_style`。
 - **任务路由**：通过 `task_name="replyer"` 使用 Host 的 replyer 任务，而不是指定一个叫 replyer 的具体模型。
 - **超时与 fallback**：历史读取和 LLM 生成共享 30 秒总预算，超时、异常或返回空文本时自动回退到对应的固定回复。
 - **过时回复**：同群只保留最新动态控制回复，发送前核对会话快照；解除、续期或过期后，旧生成结果不会重新发送。取消插件等待不代表远端模型请求一定停止计费。
+- **Maisaka 上下文**：由 `mute.maisaka_context_sync_enabled` 控制，默认开启。开启时，进入、续期和退出静音的触发消息会写入上下文，成功发送的固定回复和 LLM 回复也会同步写入；关闭后两类同步都会跳过。
 - **输出约束**：LLM 输出会做兜底清理——剥去包裹引号、多行只取第一个非空行、超过 100 字符时在上限内回退到最后一个句末标点处截断（找不到标点或首句过短则硬截）；清理后为空则回退固定回复。
 - **断句开关**：`mute.llm_reply_split_enabled` 默认开启；使用 MaiBot 规则分割器处理换行、引号、冒号、逗号、句号、英文分号和空格，并按主程序规则概率性合并；最多保留 8 个句段，最终最多发送 3 条，超过句段上限时回退固定回复。关闭后恢复为单条消息发送。
 - **上下文**：最多读取 10 条群聊消息，每条正文最多 500 字符，上下文总计最多 3000 字符；昵称最多 80 字符。读取失败不阻断生成，仍以无上下文方式继续。
@@ -153,8 +154,9 @@
 | `mute.no_permission_reply` | str | `？？？你在教我做事🤡` | 非管理员尝试触发静音时的拒绝回复 |
 | `mute.learn_while_muted` | bool | `true` | 静音期间是否把当前聊天流发言频率调整为 `0`，让麦麦继续读取群聊上下文 |
 | `mute.persist_sessions` | bool | `true` | 持久化静音会话，重启/重载恢复未到期会话 |
+| `mute.maisaka_context_sync_enabled` | bool | `true` | 是否将静音控制词和本插件回复同步到 Maisaka 上下文 |
 | `mute.llm_reply_enabled` | bool | `false` | 是否使用 LLM 动态生成回复文案（关闭时使用各固定回复字段） |
-| `mute.llm_reply_prompt` | str | `根据以下事件和群聊语气...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` 占位符 |
+| `mute.llm_reply_prompt` | str | `根据麦麦的全局人设和回复风格...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` `{personality}` `{reply_style}` 占位符 |
 | `mute.llm_reply_use_context` | bool | `false` | LLM 生成回复时是否读取最近 10 条群聊消息作为上下文 |
 | `mute.llm_reply_split_enabled` | bool | `true` | 是否将 LLM 动态回复按规则拆分后分多条发送 |
 | `mute.llm_reply_max_tokens` | int | `200` | LLM 生成回复的最大 token 数，必须大于等于 1；开启思考时可适当调大 |

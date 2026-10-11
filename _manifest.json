@@ -30,7 +30,8 @@
     "chat.get_group_streams",
     "api.call",
     "llm.generate",
-    "message.get_recent"
+    "message.get_recent",
+    "maisaka.context.append"
   ],
   "i18n": {
     "default_locale": "zh-CN",
