@@ -2,21 +2,22 @@
 
 允许管理员通过聊天命令，让麦麦在指定群聊中临时进入“静音状态”。
 静音期间默认会让麦麦以发言频率 0 纯窥屏；关闭该功能时才会入站拦截所有群消息。
-管理员可通过关键词指令或 @麦麦 解除静音。
+管理员可通过关键词指令、/muteon、/muteoff 或 @麦麦解除静音。
 
 实现方案：
-    1. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook。
-       此 Hook 在消息预处理完成后、Command 匹配之前触发，
-       控制指令会通过返回 {"action": "abort"} 消费；普通消息在纯窥屏模式下放行。
-    2. 主动沉默：注册 silence Tool，允许麦麦自主决定进入指定时长的沉默。
-    3. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
+    1. 命令控制：使用 @Command 正式注册 /muteon 和 /muteoff；
+       命令处理器复用统一的静音决策、权限、回复和 Maisaka 上下文流程。
+    2. 入站拦截：使用 @HookHandler 订阅 chat.receive.after_process Hook，
+       处理关键词控制指令、@麦麦解除，以及静音期间的普通消息。
+    3. 主动沉默：注册 silence Tool，允许麦麦自主决定进入指定时长的沉默。
+    4. 出站拦截：使用 @HookHandler 订阅 send_service.before_send Hook。
        此 Hook 在消息即将发送前触发，用于拦截静音前已进入思考流程、
        但在静音后才生成回复的"漏网"消息。
-    4. 只读查询：公开 group_muter.get_status API，供戳一戳等绕过发送服务
+    5. 只读查询：公开 group_muter.get_status API，供戳一戳等绕过发送服务
        直接调适配器 API 的插件在动作前自查静音状态。
 """
 
-from maibot_sdk import API, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import API, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from pydantic import field_validator, model_validator
 
@@ -30,7 +31,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 
@@ -60,6 +61,10 @@ CONFIG_SCHEMA_VERSION = "2.4.0"
 # Host 把 at 段重渲染为 "@群名片"/"@昵称"（SessionMessage.process_at_component），
 # 两个适配器都不产 CQ 码，这里不再匹配 [CQ:at,...]。
 _AT_PREFIX_PATTERN = re.compile(r"@\S+")
+_MUTE_ON_COMMAND = "/muteon"
+_MUTE_OFF_COMMAND = "/muteoff"
+_MUTE_ON_COMMAND_COMPONENT_NAME = "TAIY2020.group-muter-plugin.muteon"
+_MUTE_OFF_COMMAND_COMPONENT_NAME = "TAIY2020.group-muter-plugin.muteoff"
 
 # 窥屏确认后的周期复核：runtime 被 Host 重建（清空上下文指令 / LRU 淘汰）后调整值
 # 回到 1.0，插件的 _peek_confirmed 快速路径却不再 set_adjust。摘要循环每轮对已确认
@@ -79,7 +84,7 @@ _PEEK_FREQUENCY_EPSILON = 1e-6
 
 # LLM 动态回复
 
-_LLM_DEFAULT_REPLY_PROMPT = "根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n事件：{event}\n固定回复参考：{fallback}\n{context}"
+_LLM_DEFAULT_REPLY_PROMPT = "{personality}\n根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}"
 
 _LLM_EVENT_LABELS = {
     "start_mute": "管理员要求你在群聊中静音",
@@ -87,6 +92,7 @@ _LLM_EVENT_LABELS = {
     "end_mute": "管理员解除了你在群聊中的静音",
     "refuse_start": "非管理员试图让你静音但被拒绝",
 }
+_SILENCE_TOOL_COMPONENT_NAME = "TAIY2020.group-muter-plugin.silence"
 
 _LLM_GENERATE_TIMEOUT = 30
 # 一两句话的短回复绰绰有余；模型不听话输出长文时靠它硬截断，
@@ -161,6 +167,11 @@ class MuteSection(PluginConfigBase):
         description="解除静音的关键词列表",
         json_schema_extra={"label": "解除关键词", "hint": "管理员发送这些词时解除静音"},
     )
+    enable_slash_commands: bool = Field(
+        default=True,
+        description="是否启用内置 /muteon 和 /muteoff 命令",
+        json_schema_extra={"label": "启用斜杠命令"},
+    )
     enable_unmute: bool = Field(
         default=True,
         description="是否启用解除静音关键词",
@@ -207,6 +218,11 @@ class MuteSection(PluginConfigBase):
             "hint": "关闭则保持旧行为：重启后静音状态丢失，需重新发送关键词。",
         },
     )
+    maisaka_context_sync_enabled: bool = Field(
+        default=True,
+        description="是否将静音控制词和本插件发送的回复同步到 Maisaka 上下文",
+        json_schema_extra={"label": "同步 Maisaka 上下文"},
+    )
     llm_reply_enabled: bool = Field(
         default=False,
         description="是否使用 LLM 动态生成回复文案（默认关闭，关闭时使用固定回复）",
@@ -214,7 +230,7 @@ class MuteSection(PluginConfigBase):
     )
     llm_reply_prompt: str = Field(
         default=_LLM_DEFAULT_REPLY_PROMPT,
-        description="LLM 生成回复的提示词模板，支持 {event} {fallback} {context} 占位符",
+        description="LLM 生成回复的提示词模板，支持 {event} {fallback} {context} {personality} {reply_style} 占位符",
         json_schema_extra={"label": "LLM 提示词模板"},
     )
     llm_reply_use_context: bool = Field(
@@ -737,6 +753,43 @@ def _strip_at_prefix(text: str) -> str:
     return _AT_PREFIX_PATTERN.sub("", text).strip()
 
 
+def _is_builtin_mute_command(
+    text: str,
+    command: str,
+    *,
+    allow_at_prefix: bool = False,
+) -> bool:
+    """判断文本（去除 @前缀后）是否为精确的内置斜杠命令。"""
+    normalized = text.strip()
+    if normalized == command:
+        return True
+    return (
+        allow_at_prefix
+        and normalized.startswith("@")
+        and _strip_at_prefix(normalized) == command
+    )
+
+
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    """把 Command 运行时可能传入的模型对象转换为浅层字典。"""
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="python")
+        except TypeError:
+            dumped = model_dump()
+        return dict(dumped) if isinstance(dumped, dict) else {}
+    if hasattr(value, "__dict__"):
+        return {
+            key: item
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return {}
+
+
 # 模型"不听话"时常见的包裹引号对：左引号 → 对应右引号
 _LLM_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
 
@@ -1041,7 +1094,8 @@ class MessageContext:
     """从序列化的 SessionMessage 字典提取的关键字段集合（入站/出站共用）。
 
     "如何从 message dict 挖字段"的知识单点集中在 ``from_message``；
-    出站消息缺少 plain_text / user_id 等字段时安全回退为空串，调用方按需读取。
+    出站消息缺少 plain_text / user_id / user_name 等字段时安全回退为空串，
+    调用方按需读取。
 
     ``is_bot_mentioned`` 依赖 adapter 在入站时正确设置 ``is_at`` / ``is_mentioned``，
     语义为"@ 到 bot 自己"。napcat adapter 已实现该契约（仅当
@@ -1058,6 +1112,7 @@ class MessageContext:
     user_id: str = ""
     is_bot_mentioned: bool = False
     platform: str = ""
+    user_name: str = ""
 
     @classmethod
     def from_message(cls, message: Optional[dict]) -> "MessageContext":
@@ -1089,6 +1144,11 @@ class MessageContext:
             # 消息顶层，message_info 内只有 user_info / group_info / additional_config；
             # 保留 message_info 回退仅为容忍其它来源的消息形态。
             platform=str(message.get("platform") or msg_info.get("platform") or ""),
+            user_name=str(
+                user_info.get("user_cardname")
+                or user_info.get("user_nickname")
+                or ""
+            ).strip()[:80],
         )
 
 
@@ -1265,13 +1325,30 @@ class MuteIntentResolver:
         if not context.group_id:
             return MuteIntent(kind="pass_through")
 
+        mute_on_command = (
+            mute_config.enable_slash_commands
+            and _is_builtin_mute_command(
+                context.plain_text,
+                _MUTE_ON_COMMAND,
+                allow_at_prefix=context.is_bot_mentioned,
+            )
+        )
+        mute_off_command = (
+            mute_config.enable_slash_commands
+            and _is_builtin_mute_command(
+                context.plain_text,
+                _MUTE_OFF_COMMAND,
+                allow_at_prefix=context.is_bot_mentioned,
+            )
+        )
+
         # --- 未静音 ---
         if not muted:
             if _is_keyword_in_text(
                 context.plain_text,
                 mute_config.mute_keywords,
                 allow_at_suffix_match=context.is_bot_mentioned,
-            ):
+            ) or mute_on_command:
                 if is_admin:
                     return MuteIntent(
                         kind="start_mute",
@@ -1294,11 +1371,16 @@ class MuteIntentResolver:
         # 任何关键词"才走 @ 解除。
         if (
             is_admin
-            and mute_config.enable_unmute
-            and _is_keyword_in_text(
-                context.plain_text,
-                mute_config.unmute_keywords,
-                allow_at_suffix_match=context.is_bot_mentioned,
+            and (
+                mute_off_command
+                or (
+                    mute_config.enable_unmute
+                    and _is_keyword_in_text(
+                        context.plain_text,
+                        mute_config.unmute_keywords,
+                        allow_at_suffix_match=context.is_bot_mentioned,
+                    )
+                )
             )
         ):
             return MuteIntent(
@@ -1306,10 +1388,13 @@ class MuteIntentResolver:
                 group_id=context.group_id,
                 stream_id=context.stream_id,
             )
-        if is_admin and _is_keyword_in_text(
-            context.plain_text,
-            mute_config.mute_keywords,
-            allow_at_suffix_match=context.is_bot_mentioned,
+        if is_admin and (
+            mute_on_command
+            or _is_keyword_in_text(
+                context.plain_text,
+                mute_config.mute_keywords,
+                allow_at_suffix_match=context.is_bot_mentioned,
+            )
         ):
             # 静音中管理员再发静音关键词 → 续期（重置计时），不再静默吞掉
             return MuteIntent(
@@ -1356,9 +1441,9 @@ class _RefCountedLock:
 class GroupMuterPlugin(MaiBotPlugin):
     """群聊静音插件。
 
+    使用 @Command 注册 /muteon 和 /muteoff，
     使用 @HookHandler 订阅 chat.receive.after_process Hook，
-    在消息预处理完成后、Command 匹配之前拦截静音群的消息。
-    不使用任何 @Command，不会影响其他插件的命令匹配。
+    在消息预处理完成后拦截关键词和静音期间的普通消息。
     """
 
     config_model = GroupMuterConfig
@@ -1402,9 +1487,14 @@ class GroupMuterPlugin(MaiBotPlugin):
         # _restore_all_frequency_adjustments 跑完之后又 set_adjust(0)，把某 stream 的
         # 频率永久留在 0（且被下一代实例的 get_adjust 误读为原始 baseline）。
         self._unloading = False
+        # 只有两个 COMMAND 组件都同步成功后，入站 Hook 才会把直达斜杠命令
+        # 交给正式命令分发器；同步失败时回退到 Hook 路径，避免命令失效。
+        self._slash_commands_delegated = False
 
     async def on_load(self) -> None:
         self._admin_roster.refresh(self.config.user_control)
+        await self._sync_silence_tool_state()
+        await self._sync_slash_command_state()
         if self.config.mute.persist_sessions:
             await self._init_session_persistence()
         logger.info("群聊静音插件(v%s)初始化完成。", PLUGIN_VERSION)
@@ -1576,6 +1666,8 @@ class GroupMuterPlugin(MaiBotPlugin):
         """配置热重载回调。"""
         if scope == "self":
             self._admin_roster.refresh(self.config.user_control)
+            await self._sync_silence_tool_state()
+            await self._sync_slash_command_state()
             if not self.config.mute.learn_while_muted:
                 await self._restore_all_frequency_adjustments()
             # 持久化开关热切换：关→停止接收并排空在途写入；开→补初始化。
@@ -1587,6 +1679,116 @@ class GroupMuterPlugin(MaiBotPlugin):
                     await self._drain_session_writes()
                 elif not self._session_file and not self._unloading:
                     await self._init_session_persistence(restore=False)
+
+    async def _sync_silence_tool_state(self) -> None:
+        """让 Planner 中 silence 工具的可用状态跟随配置开关。"""
+        enabled = self.config.tool.enabled
+        try:
+            if enabled:
+                result = await self.ctx.component.enable_component(
+                    _SILENCE_TOOL_COMPONENT_NAME,
+                    "TOOL",
+                    scope="global",
+                )
+            else:
+                result = await self.ctx.component.disable_component(
+                    _SILENCE_TOOL_COMPONENT_NAME,
+                    "TOOL",
+                    scope="global",
+                )
+            if result is False or (
+                isinstance(result, dict) and result.get("success") is False
+            ):
+                logger.warning(
+                    "[mute_guard] 同步 silence 工具状态失败 (enabled=%s): %s",
+                    enabled,
+                    result.get("error", result) if isinstance(result, dict) else result,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[mute_guard] 同步 silence 工具状态失败 (enabled=%s)",
+                enabled,
+                exc_info=True,
+            )
+
+    async def _sync_slash_command_state(self) -> None:
+        """让正式斜杠命令组件跟随配置开关。"""
+        enabled = self.config.mute.enable_slash_commands
+        component_method = (
+            self.ctx.component.enable_component
+            if enabled
+            else self.ctx.component.disable_component
+        )
+        sync_succeeded = True
+        for component_name in (
+            _MUTE_ON_COMMAND_COMPONENT_NAME,
+            _MUTE_OFF_COMMAND_COMPONENT_NAME,
+        ):
+            try:
+                result = await component_method(
+                    component_name,
+                    "COMMAND",
+                    scope="global",
+                )
+                if result is False or (
+                    isinstance(result, dict) and result.get("success") is False
+                ):
+                    sync_succeeded = False
+                    logger.warning(
+                        "[mute_guard] 同步斜杠命令组件状态失败 "
+                        "(component=%s, enabled=%s): %s",
+                        component_name,
+                        enabled,
+                        result.get("error", result) if isinstance(result, dict) else result,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                sync_succeeded = False
+                logger.warning(
+                    "[mute_guard] 同步斜杠命令组件状态失败 "
+                    "(component=%s, enabled=%s)",
+                    component_name,
+                    enabled,
+                    exc_info=True,
+                )
+        self._slash_commands_delegated = enabled and sync_succeeded
+
+    @Command(
+        "muteon",
+        description="开启或续期当前群聊的静音状态",
+        pattern=r"^/muteon\s*$",
+    )
+    async def handle_mute_on_command(
+        self,
+        message: Any = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, int]:
+        """处理正式注册的 ``/muteon`` 命令。"""
+        return await self._handle_registered_mute_command(
+            _MUTE_ON_COMMAND,
+            message=message,
+            **kwargs,
+        )
+
+    @Command(
+        "muteoff",
+        description="解除当前群聊的静音状态",
+        pattern=r"^/muteoff\s*$",
+    )
+    async def handle_mute_off_command(
+        self,
+        message: Any = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, int]:
+        """处理正式注册的 ``/muteoff`` 命令。"""
+        return await self._handle_registered_mute_command(
+            _MUTE_OFF_COMMAND,
+            message=message,
+            **kwargs,
+        )
 
     @Tool(
         "silence",
@@ -1703,6 +1905,50 @@ class GroupMuterPlugin(MaiBotPlugin):
         """
         context = MessageContext.from_message(message)
 
+        # 斜杠命令已由正式 @Command 组件接管。这里必须放行，避免在
+        # Command 分发前被 Hook 消费；@ 麦麦后再跟命令的旧写法仍由
+        # 原有 Hook 路径处理。
+        if (
+            self._slash_commands_delegated
+            and (
+                _is_builtin_mute_command(context.plain_text, _MUTE_ON_COMMAND)
+                or _is_builtin_mute_command(context.plain_text, _MUTE_OFF_COMMAND)
+            )
+        ):
+            return None
+
+        return await self._process_mute_context(context)
+
+    async def _handle_registered_mute_command(
+        self,
+        command: str,
+        *,
+        message: Any = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, int]:
+        """把正式 Command 组件转换为现有静音决策/副作用流程。"""
+        if not self.config.mute.enable_slash_commands:
+            return False, "", 0
+
+        context = self._message_context_from_command(
+            command,
+            message=message,
+            kwargs=kwargs,
+        )
+        context = replace(context, plain_text=command)
+        result = await self._process_mute_context(context)
+        if isinstance(result, dict) and result.get("action") == "abort":
+            # 回复已经由 _dispatch_intent 后台发送；返回空正文避免 Command
+            # 分发器再次发送一条重复回复，拦截等级 2 与 Hook 保持一致。
+            return True, "", 2
+        return False, "", 0
+
+    async def _process_mute_context(
+        self,
+        context: MessageContext,
+    ) -> Optional[Dict[str, Any]]:
+        """处理一条已解析的静音控制/普通群消息。"""
+
         known_stream_id = context.stream_id or self._mute_status.stream_for_group(context.group_id)
         had_session = self._mute_status.has_mute_session(context.group_id)
         muted = self._mute_status.is_muted(context.group_id)
@@ -1722,7 +1968,85 @@ class GroupMuterPlugin(MaiBotPlugin):
             is_admin=is_admin,
             mute_config=self.config.mute,
         )
+        if intent.kind in ("start_mute", "renew_mute", "end_mute"):
+            await self._append_control_trigger_to_maisaka(context, intent.kind)
         return await self._dispatch_intent(intent)
+
+    @staticmethod
+    def _message_context_from_command(
+        command: str,
+        *,
+        message: Any,
+        kwargs: Dict[str, Any],
+    ) -> MessageContext:
+        """兼容 Command 运行时传入的消息字典与扁平 kwargs。"""
+        raw_message = _coerce_mapping(message)
+
+        raw_message.setdefault(
+            "processed_plain_text",
+            str(
+                raw_message.get("processed_plain_text")
+                or kwargs.get("processed_plain_text")
+                or kwargs.get("plain_text")
+                or command
+            ),
+        )
+        raw_message.setdefault(
+            "session_id",
+            str(raw_message.get("session_id") or kwargs.get("stream_id") or kwargs.get("session_id") or ""),
+        )
+        raw_message.setdefault(
+            "platform",
+            str(raw_message.get("platform") or kwargs.get("platform") or ""),
+        )
+        raw_message.setdefault(
+            "is_at",
+            bool(raw_message.get("is_at") or kwargs.get("is_at") or kwargs.get("is_mentioned")),
+        )
+
+        message_info = _coerce_mapping(raw_message.get("message_info"))
+        user_info = _coerce_mapping(
+            message_info.get("user_info") or raw_message.get("user_info"),
+        )
+        group_info = _coerce_mapping(
+            message_info.get("group_info") or raw_message.get("group_info"),
+        )
+        additional_config = _coerce_mapping(
+            message_info.get("additional_config") or raw_message.get("additional_config"),
+        )
+
+        for field_name in ("user_id", "user_cardname", "user_nickname"):
+            if not user_info.get(field_name):
+                value = kwargs.get(field_name)
+                if value is None:
+                    value = raw_message.get(field_name)
+                if value is not None:
+                    user_info[field_name] = value
+        for field_name in ("group_id", "group_name"):
+            if not group_info.get(field_name):
+                value = kwargs.get(field_name)
+                if value is None:
+                    value = raw_message.get(field_name)
+                if value is not None:
+                    group_info[field_name] = value
+        if (
+            not additional_config.get("platform_io_target_group_id")
+            and (
+                kwargs.get("platform_io_target_group_id") is not None
+                or raw_message.get("platform_io_target_group_id") is not None
+            )
+        ):
+            additional_config["platform_io_target_group_id"] = (
+                kwargs.get("platform_io_target_group_id")
+                if kwargs.get("platform_io_target_group_id") is not None
+                else raw_message.get("platform_io_target_group_id")
+            )
+
+        message_info["user_info"] = user_info
+        message_info["group_info"] = group_info
+        message_info["additional_config"] = additional_config
+        raw_message["message_info"] = message_info
+        return MessageContext.from_message(raw_message)
 
     async def _dispatch_intent(self, intent: MuteIntent) -> Optional[Dict[str, Any]]:
         """根据 intent 执行副作用（修改 mute 状态 + 发回复 + 日志）。
@@ -2380,11 +2704,17 @@ class GroupMuterPlugin(MaiBotPlugin):
             context_text = ""
             if self.config.mute.llm_reply_use_context and stream_id:
                 context_text = await self._fetch_recent_context(stream_id)
+            personality, reply_style = await asyncio.gather(
+                self.ctx.config.get("personality.personality", ""),
+                self.ctx.config.get("personality.reply_style", ""),
+            )
             rendered = (
                 self.config.mute.llm_reply_prompt
                 .replace("{event}", _LLM_EVENT_LABELS.get(event, event))
                 .replace("{fallback}", fallback)
                 .replace("{context}", context_text)
+                .replace("{personality}", str(personality or ""))
+                .replace("{reply_style}", str(reply_style or ""))
             )
             return await self.ctx.llm.generate(
                 prompt=rendered,
@@ -2556,7 +2886,13 @@ class GroupMuterPlugin(MaiBotPlugin):
         显式检查 sent，不能把非空的失败详情字典当成发送成功。
         """
         try:
-            result = await self.ctx.send.text(text, stream_id, return_details=True)
+            result = await self.ctx.send.text(
+                text,
+                stream_id,
+                return_details=True,
+                sync_to_maisaka_history=self.config.mute.maisaka_context_sync_enabled,
+                maisaka_source_kind=f"plugin:TAIY2020.group-muter-plugin:{label}",
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2575,6 +2911,54 @@ class GroupMuterPlugin(MaiBotPlugin):
             logger.debug(
                 "[mute_guard] %s 控制消息已投递 (stream=%s, message_id=%s)",
                 label, stream_id, result.get("message_id"),
+            )
+
+    async def _append_control_trigger_to_maisaka(
+        self,
+        context: MessageContext,
+        label: str,
+    ) -> None:
+        """将静音控制事件说明写入 Maisaka 用户上下文。"""
+        if not self.config.mute.maisaka_context_sync_enabled or not context.stream_id:
+            return
+
+        event_text = _LLM_EVENT_LABELS.get(label, "静音控制指令")
+        user_name = context.user_name.strip()
+        user_id = context.user_id.strip()
+        if user_name and user_id:
+            actor = f"{user_name}（用户标识：{user_id}）"
+        elif user_name:
+            actor = user_name
+        elif user_id:
+            actor = f"用户标识：{user_id}"
+        else:
+            actor = "未知用户"
+        text = f"{actor} 执行了静音控制：{event_text}"
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.maisaka.context.append(
+                    stream_id=context.stream_id,
+                    segments=[{"type": "text", "content": text}],
+                    visible_text=text,
+                    source_kind=f"plugin:TAIY2020.group-muter-plugin:{label}",
+                ),
+                timeout=1.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[mute_guard] 记录 Maisaka 控制指令上下文失败 (stream=%s)",
+                context.stream_id,
+                exc_info=True,
+            )
+            return
+
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning(
+                "[mute_guard] 记录 Maisaka 控制指令上下文失败 (stream=%s): %s",
+                context.stream_id,
+                result.get("error", "未知错误"),
             )
 
 

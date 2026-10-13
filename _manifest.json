@@ -29,8 +29,12 @@
     "frequency.set_adjust",
     "chat.get_group_streams",
     "api.call",
+    "config.get",
+    "component.enable",
+    "component.disable",
     "llm.generate",
-    "message.get_recent"
+    "message.get_recent",
+    "maisaka.context.append"
   ],
   "i18n": {
     "default_locale": "zh-CN",
