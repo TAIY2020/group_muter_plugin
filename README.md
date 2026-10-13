@@ -4,17 +4,17 @@
 
 这个插件为群组管理员提供了一个强大的工具来让麦麦“静音”（闭嘴）。当群聊需要专注讨论或减少麦麦干扰时，管理员可以一键“静音”麦麦。默认情况下，静音期间麦麦会进入纯窥屏状态：继续读取群聊上下文，但通过发言频率 0 和出站守卫避免发言；关闭 `mute.learn_while_muted` 后才会直接拦截普通群消息，直到被管理员唤醒或到达静音时间自动解除静音。
 
-> 本版本基于 **MaiBot SDK v2** 重写，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，并注册 `silence` Tool 供麦麦主动进入沉默，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本基于 **MaiBot SDK v2** 重写，使用 `@Command` 正式注册 `/muteon`、`/muteoff`，使用 `@HookHandler` 装饰器实现入站/出站双重拦截，并注册 `silence` Tool 供麦麦主动进入沉默，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
 - **动态控制**: 无需重启，通过简单的聊天命令即可实时开启或关闭麦麦的静音模式。
 - **双重拦截**:
-  - **入站拦截**: 通过 `chat.receive.after_process` Hook 在消息预处理后拦截，阻止消息进入后续流程。
+  - **入站拦截**: 通过 `chat.receive.after_process` Hook 在消息预处理后拦截关键词和静音期间的普通消息；`/muteon`、`/muteoff` 由正式 Command 组件处理。
   - **出站拦截**: 通过 `send_service.before_send` Hook 拦截静音前已进入思考流程、但在静音后才生成回复的“漏网”消息。
 - **主动沉默工具**: 注册 `silence` LLM Tool，麦麦可在判断自己不适合继续发言时主动让当前群聊进入沉默。
 - **多种唤醒方式**:
-  - **命令唤醒**: 管理员使用特定关键词即可主动唤醒。
+  - **命令唤醒**: 管理员可使用已注册的 `/muteon`、`/muteoff` 命令，或配置的关键词控制静音状态；斜杠命令可单独关闭。
   - **@提及唤醒**: 管理员在群里 `@` 麦麦，即可立即唤醒麦麦。
   - **自动解除**: 静音时间到达后，麦麦将自动解除静音，恢复正常聊天。
 - **高度可配置**: 静音时长、触发关键词、麦麦的回复语均可在配置文件或 Web UI 中轻松修改。
@@ -52,7 +52,7 @@
 
 ### 开启静音
 
-管理员在群聊中发送配置的静音关键词即可开启静音模式。
+管理员在群聊中发送 `/muteon` 或配置的静音关键词即可开启静音模式。`/muteon` 是 MaiBot SDK 正式注册的精确命令组件，受 `mute.enable_slash_commands` 控制但不受关键词列表配置影响；关闭开关时两个斜杠命令组件会同步禁用。静音期间再次发送会续期，成功执行后会按对应事件说明写入 Maisaka 上下文。
 
 - **默认关键词**: `Mute True` 或 `安安你去看书去`
 - **麦麦回复**: 由 `mute.mute_reply` 配置（默认 `好吧，那我去看会书📘，你们先聊...`）
@@ -66,7 +66,7 @@
 
 ### 主动沉默（silence 工具）
 
-插件会向 MaiBot 注册 `silence` Tool。麦麦可以在以下场景自主调用：
+`tool.enabled` 开启时，插件会向 MaiBot 注册并启用 `silence` Tool；关闭时会从 Planner 的可用工具集中禁用。配置热更新会同步开关状态。麦麦可以在以下场景自主调用：
 
 - 觉得自己话太多，应该暂时少参与讨论。
 - 群聊气氛不适合继续插话。
@@ -88,23 +88,27 @@
 
 ### 解除静音
 
-有三种方式可以解除静音：
+有四种方式可以解除静音：
 
-#### 方式一：关键词解除
+#### 方式一：`/muteoff` 命令
+
+管理员发送精确命令 `/muteoff` 即可解除静音（需启用 `mute.enable_slash_commands`）。该命令同样会写入 Maisaka 上下文，并使用配置的解除回复。
+
+#### 方式二：关键词解除
 
 管理员发送配置的解除关键词。
 
 - **默认关键词**: `Mute False` 或 `安安别看了`
 - **麦麦回复**: 由 `mute.unmute_reply` 配置（默认 `我回来啦，你们聊啥呢🤔`）
 
-#### 方式二：@提及解除
+#### 方式三：@提及解除
 
 管理员在群里 `@` 麦麦，即可立即解除静音。
 
 - **麦麦回复**: 同样使用 `mute.unmute_reply`
 - **注意**: 消息中同时含关键词时按关键词处理——例如 `@麦麦 Mute True` 是续期而非解除，只有"@ 了麦麦且不含任何关键词"才走 @ 解除。
 
-#### 方式三：自动超时解除
+#### 方式四：自动超时解除
 
 静音时间到达后（默认 1200 秒 = 20 分钟），麦麦将自动解除静音，恢复正常聊天。
 
@@ -129,10 +133,11 @@
 
 - **启用后**：开启静音、续期、解除、拒绝权限四类回复使用 LLM 生成动态文案。
 - **关闭时**：完全沿用现有固定回复，不调用 LLM 或消息历史接口。
-- **提示词模板**：默认模板包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）、`{context}`（最近消息，需开启上下文）三个占位符，可通过 `mute.llm_reply_prompt` 自定义。
+- **提示词模板**：默认模板先插入 `{personality}`（麦麦全局人设），再给出回复要求，并以“回复风格：`{reply_style}`”提供麦麦全局回复风格；随后包含 `{event}`（事件说明）、`{fallback}`（原有固定回复）和 `{context}`（最近消息，需开启群聊上下文）。可通过 `mute.llm_reply_prompt` 自定义；人设和回复风格分别读取 MaiBot 全局配置 `personality.personality` 和 `personality.reply_style`。
 - **任务路由**：通过 `task_name="replyer"` 使用 Host 的 replyer 任务，而不是指定一个叫 replyer 的具体模型。
 - **超时与 fallback**：历史读取和 LLM 生成共享 30 秒总预算，超时、异常或返回空文本时自动回退到对应的固定回复。
 - **过时回复**：同群只保留最新动态控制回复，发送前核对会话快照；解除、续期或过期后，旧生成结果不会重新发送。取消插件等待不代表远端模型请求一定停止计费。
+- **Maisaka 上下文**：由 `mute.maisaka_context_sync_enabled` 控制，默认开启。开启时，进入、续期和退出静音对应的事件说明及触发者显示名/用户标识会写入上下文，成功发送的固定回复和 LLM 回复也会同步写入；关闭后两类同步都会跳过。
 - **输出约束**：LLM 输出会做兜底清理——剥去包裹引号、多行只取第一个非空行、超过 100 字符时在上限内回退到最后一个句末标点处截断（找不到标点或首句过短则硬截）；清理后为空则回退固定回复。
 - **断句开关**：`mute.llm_reply_split_enabled` 默认开启；使用 MaiBot 规则分割器处理换行、引号、冒号、逗号、句号、英文分号和空格，并按主程序规则概率性合并；最多保留 8 个句段，最终最多发送 3 条，超过句段上限时回退固定回复。关闭后恢复为单条消息发送。
 - **上下文**：最多读取 10 条群聊消息，每条正文最多 500 字符，上下文总计最多 3000 字符；昵称最多 80 字符。读取失败不阻断生成，仍以无上下文方式继续。
@@ -145,7 +150,8 @@
 | `mute.duration_seconds` | int | `1200` | 静音持续时间（秒），范围 60 ~ 86400，越界值自动收敛到边界 |
 | `mute.mute_keywords` | list | `["Mute True", "安安你去看书去"]` | 触发静音的关键词列表 |
 | `mute.unmute_keywords` | list | `["Mute False", "安安别看了"]` | 解除静音的关键词列表 |
-| `mute.enable_unmute` | bool | `true` | 是否启用关键词解除功能 |
+| `mute.enable_slash_commands` | bool | `true` | 是否启用已注册的 `/muteon` 和 `/muteoff` 命令组件；不影响关键词匹配 |
+| `mute.enable_unmute` | bool | `true` | 是否启用关键词解除功能；不影响内置 `/muteoff` 命令 |
 | `mute.at_mention_break` | bool | `true` | 管理员 @麦麦 时是否自动解除静音 |
 | `mute.mute_reply` | str | `好吧，那我去看会书📘，你们先聊...` | 开启静音时麦麦的回复语 |
 | `mute.renew_reply` | str | `好哦，那我再多看一会书📘` | 静音期间管理员再次发送静音关键词（续期）时的回复语 |
@@ -153,8 +159,9 @@
 | `mute.no_permission_reply` | str | `？？？你在教我做事🤡` | 非管理员尝试触发静音时的拒绝回复 |
 | `mute.learn_while_muted` | bool | `true` | 静音期间是否把当前聊天流发言频率调整为 `0`，让麦麦继续读取群聊上下文 |
 | `mute.persist_sessions` | bool | `true` | 持久化静音会话，重启/重载恢复未到期会话 |
+| `mute.maisaka_context_sync_enabled` | bool | `true` | 是否将静音事件（含触发者显示名/用户标识）和本插件回复同步到 Maisaka 上下文 |
 | `mute.llm_reply_enabled` | bool | `false` | 是否使用 LLM 动态生成回复文案（关闭时使用各固定回复字段） |
-| `mute.llm_reply_prompt` | str | `根据以下事件和群聊语气...` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` 占位符 |
+| `mute.llm_reply_prompt` | str | `{personality}\n根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}` | LLM 生成回复的提示词模板，支持 `{event}` `{fallback}` `{context}` `{personality}` `{reply_style}` 占位符 |
 | `mute.llm_reply_use_context` | bool | `false` | LLM 生成回复时是否读取最近 10 条群聊消息作为上下文 |
 | `mute.llm_reply_split_enabled` | bool | `true` | 是否将 LLM 动态回复按规则拆分后分多条发送 |
 | `mute.llm_reply_max_tokens` | int | `200` | LLM 生成回复的最大 token 数，必须大于等于 1；开启思考时可适当调大 |
@@ -162,7 +169,7 @@
 | `user_control.list` | list | `[]` | 拥有静音操作权限的 QQ 号列表（字符串，如 `["123456"]`） |
 | `user_control.authorization_mode` | str | `list` | `list` 使用名单；`group_admin` 使用 QQ 群角色；`list_or_group_admin` 任一满足即授权 |
 | `user_control.role_cache_seconds` | int | `30` | QQ 群角色缓存秒数，范围 0 ~ 300，0 表示每次重新查询 |
-| `tool.enabled` | bool | `true` | 是否允许麦麦通过 `silence` 工具主动进入沉默 |
+| `tool.enabled` | bool | `true` | 是否向 Planner 暴露 `silence` 工具并允许主动进入沉默；热更新时同步启用状态 |
 | `tool.require_admin` | bool | `false` | 当前 Host 无可信工具身份契约，开启后拒绝主动沉默工具，请改用管理员关键词 |
 | `tool.default_duration_seconds` | int | `600` | 工具未指定时长时的默认沉默时间（秒） |
 | `tool.max_duration_seconds` | int | `10800` | 工具可主动沉默的最大时长（秒） |
@@ -209,7 +216,8 @@ v2.x 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 | 项目 | v1.x (旧版) | v2.x (新版) |
 | ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
-| 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (入站 + 出站双重拦截) |
+| 命令注册 | `BaseCommand` | `@Command` 正式注册 `/muteon`、`/muteoff` |
+| 消息拦截 | `BaseEventHandler` (ON_MESSAGE) + `BaseCommand` | `@HookHandler` 装饰器 (关键词/普通消息入站 + 出站双重拦截) |
 | 配置管理 | `config_schema` 字典 + `ConfigField` | `PluginConfigBase` 强类型模型 (Pydantic) |
 | 配置热重载 | 不支持 | 支持 `on_config_update` 回调 |
 | 日志过滤 | 自定义 `GroupMuterLogFilter` 过滤控制台日志 | 由 SDK 统一管理 |
