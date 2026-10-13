@@ -55,7 +55,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "2.4.0"
+CONFIG_SCHEMA_VERSION = "2.5.0"
 
 # 预编译正则：剥掉 processed_plain_text 中的 "@名片" 前缀。
 # Host 把 at 段重渲染为 "@群名片"/"@昵称"（SessionMessage.process_at_component），
