@@ -15,11 +15,20 @@
        但在静音后才生成回复的"漏网"消息。
     5. 只读查询：公开 group_muter.get_status API，供戳一戳等绕过发送服务
        直接调适配器 API 的插件在动作前自查静音状态。
+    6. 配置页控件（SDK 2.19+）：WebUI 插件设置页展示静音状态，并提供
+       "解除全部静音"按钮。
 """
 
 from maibot_sdk import API, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from pydantic import field_validator, model_validator
+
+try:
+    from maibot_sdk import ConfigWidget, ConfigWidgetState
+except ImportError:
+    # SDK < 2.19 没有配置页运行时控件：不声明控件，其余功能照常运行。
+    ConfigWidget = None
+    ConfigWidgetState = None
 
 import asyncio
 import logging
@@ -55,7 +64,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "2.5.0"
+CONFIG_SCHEMA_VERSION = "2.6.0"
 
 # 预编译正则：剥掉 processed_plain_text 中的 "@名片" 前缀。
 # Host 把 at 段重渲染为 "@群名片"/"@昵称"（SessionMessage.process_at_component），
@@ -85,6 +94,12 @@ _PEEK_FREQUENCY_EPSILON = 1e-6
 # LLM 动态回复
 
 _LLM_DEFAULT_REPLY_PROMPT = "{personality}\n根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}"
+# 历史版本的默认提示词：配置升级只保留用户已有值，未改动过默认值的用户会一直
+# 停在旧模板、用不上人设占位符。仅与这些原文完全一致时迁移为当前默认值。
+_LLM_LEGACY_DEFAULT_REPLY_PROMPTS = frozenset({
+    "根据以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n事件：{event}\n固定回复参考：{fallback}\n{context}",
+    "根据麦麦的全局人设和回复风格，以及以下事件和群聊语气，生成一条简短自然的回复（只输出回复正文，不需要引号或额外说明）：\n全局人设：{personality}\n全局回复风格：{reply_style}\n事件：{event}\n固定回复参考：{fallback}\n{context}",
+})
 
 _LLM_EVENT_LABELS = {
     "start_mute": "管理员要求你在群聊中静音",
@@ -93,6 +108,14 @@ _LLM_EVENT_LABELS = {
     "refuse_start": "非管理员试图让你静音但被拒绝",
 }
 _SILENCE_TOOL_COMPONENT_NAME = "TAIY2020.group-muter-plugin.silence"
+
+# 配置页运行时控件：ID 在插件内唯一；状态文本受 Host 2000 字符上限约束
+_WIDGET_MUTE_STATUS = "mute_status"
+_WIDGET_UNMUTE_ALL = "unmute_all"
+_WIDGET_STATUS_MAX_CHARS = 2000
+# "解除全部静音"等待频率恢复的上限（秒）：Runner 对单次操作限时 8 秒，
+# 留出读取前后两次状态快照的余量；超时只是不再等待，恢复任务继续在后台执行。
+_WIDGET_RESTORE_WAIT_SECONDS = 5.0
 
 _LLM_GENERATE_TIMEOUT = 30
 # 一两句话的短回复绰绰有余；模型不听话输出长文时靠它硬截断，
@@ -262,6 +285,21 @@ class MuteSection(PluginConfigBase):
         if isinstance(value, list):
             cleaned = (str(item).strip() for item in value)
             return [item for item in cleaned if item]
+        return value
+
+    @field_validator("llm_reply_prompt", mode="before")
+    @classmethod
+    def _migrate_legacy_default_prompt(cls, value: Any) -> Any:
+        """把历史默认提示词迁移为当前默认值，用户自定义的内容原样保留。
+
+        Runner 升级配置时以新默认值为骨架、再覆盖回用户文件里已有的字段，
+        字符串类型匹配就会保留旧默认文本。这里只认完整原文（忽略首尾空白），
+        改过一个字的都视为用户自定义。迁移后的值是当前默认值，validate_assignment
+        重跑时不会再命中，幂等。
+        """
+        if isinstance(value, str) and value.strip() in _LLM_LEGACY_DEFAULT_REPLY_PROMPTS:
+            logger.info("mute.llm_reply_prompt 为旧版默认提示词，已迁移为当前默认值（加入人设与回复风格占位符）")
+            return _LLM_DEFAULT_REPLY_PROMPT
         return value
 
     @field_validator("duration_seconds", mode="before")
@@ -1448,6 +1486,33 @@ class GroupMuterPlugin(MaiBotPlugin):
 
     config_model = GroupMuterConfig
 
+    # 配置页运行时控件只存在于内存，不写入 config.toml；旧 SDK 导入失败时不声明。
+    config_widgets = (
+        [
+            ConfigWidget(id=_WIDGET_MUTE_STATUS, kind="status", label="静音状态"),
+            ConfigWidget(
+                id=_WIDGET_UNMUTE_ALL,
+                kind="action",
+                label="解除全部静音",
+                confirmation="确定解除所有群的静音并恢复发言频率？不会在群里发送解除回复。",
+            ),
+        ]
+        if ConfigWidget is not None
+        else []
+    )
+
+    def get_components(self) -> List[Dict[str, Any]]:
+        """把 silence 工具限定为群聊组件，私聊时不出现在 Planner 的工具列表里。
+
+        chat_scope 必须写在组件声明顶层：写成 ``@Tool(chat_scope=...)`` 关键字会
+        落进 metadata，Runner 只读顶层字段，注册结果仍是 "all"。旧 Runner 不认识
+        该字段时直接忽略，工具内部的群聊校验仍会拒绝私聊调用。
+        """
+        components = super().get_components()
+        for component in components:
+            if component.get("type") == "TOOL" and component.get("name") == "silence":
+                component["chat_scope"] = "group"
+        return components
     def __init__(self) -> None:
         super().__init__()
         self._admin_roster = AdminRoster()  # 权限判定缓存，on_load / on_config_update 时 refresh
@@ -2116,10 +2181,7 @@ class GroupMuterPlugin(MaiBotPlugin):
             return {"action": "abort"}
 
         if intent.kind == "end_mute":
-            self._cancel_pending_control_reply(intent.group_id)
-            stream_id = intent.stream_id or self._mute_status.stream_for_group(intent.group_id)
-            self._mute_status.clear_mute(intent.group_id)
-            self._refuse_reply_last.pop(intent.group_id, None)
+            stream_id = self._terminate_mute_session(intent.group_id, intent.stream_id)
             await self._restore_frequency_adjustment(stream_id)
             if self.config.mute.llm_reply_enabled:
                 self._spawn_llm_control_send(
@@ -2147,6 +2209,95 @@ class GroupMuterPlugin(MaiBotPlugin):
             return {"action": "abort"}
 
         return None
+
+    def _terminate_mute_session(self, group_id: str, stream_id: str = "") -> str:
+        """手动终结一个群的静音会话，返回需要恢复发言频率的 stream_id。
+
+        取消该群在途的控制回复、清除会话（持久化随 on_change 写盘）和拒绝回复
+        节流；频率恢复与回复发送由调用方决定。
+        """
+        self._cancel_pending_control_reply(group_id)
+        stream_id = stream_id or self._mute_status.stream_for_group(group_id)
+        self._mute_status.clear_mute(group_id)
+        self._refuse_reply_last.pop(group_id, None)
+        return stream_id
+
+    # ===== 配置页运行时控件 =====
+
+    async def get_config_widget_state(self) -> Dict[str, Any]:
+        """返回配置页控件状态；只读内存，不发 RPC（Host 约每 2 秒拉取一次）。
+
+        剩余时间用纯读的 remaining_seconds：已过期但尚未被惰性清理的会话按
+        0 处理、不展示，避免读取状态顺带触发过期清理与频率恢复。
+        """
+        if ConfigWidgetState is None:
+            return {}
+        lines: List[str] = []
+        for group_id in self._mute_status.export_sessions():
+            remaining = self._mute_status.remaining_seconds(group_id)
+            if remaining <= 0:
+                continue
+            stream_id = self._mute_status.stream_for_group(group_id)
+            if not self.config.mute.learn_while_muted:
+                mode = "入站拦截"
+            elif stream_id in self._peek_confirmed:
+                mode = "纯窥屏"
+            else:
+                mode = "窥屏待确认"
+            name = self._mute_status.known_group_name(group_id)
+            label = f"{name}（{group_id}）" if name else group_id
+            minutes, seconds = divmod(remaining, 60)
+            lines.append(f"{label}：剩余 {minutes} 分 {seconds} 秒，{mode}")
+        pending_restore = [
+            stream_id for stream_id in self._frequency_restore_values
+            if not self._frequency_entry_allowed(stream_id)
+        ]
+        if pending_restore:
+            lines.append(f"另有 {len(pending_restore)} 个聊天流的发言频率等待恢复")
+        muted_count = len(lines) - (1 if pending_restore else 0)
+        if lines:
+            header = f"{muted_count} 个群静音中" if muted_count else "当前没有群处于静音状态"
+            text = "\n".join([header, *lines])
+        else:
+            text = "当前没有群处于静音状态"
+        if len(text) > _WIDGET_STATUS_MAX_CHARS:
+            text = text[: _WIDGET_STATUS_MAX_CHARS - 1] + "…"
+        return {
+            _WIDGET_MUTE_STATUS: ConfigWidgetState(
+                text=text,
+                tone="warning" if muted_count or pending_restore else "neutral",
+            ),
+            _WIDGET_UNMUTE_ALL: ConfigWidgetState(
+                disabled=self._unloading
+                or not (self._mute_status.export_sessions() or self._frequency_restore_values),
+            ),
+        }
+
+    async def on_config_widget_action(self, action_id: str) -> None:
+        """处理配置页按钮：解除所有群静音，并恢复全部被纯窥屏覆盖的发言频率。
+
+        管理员在后台操作，不向各群发送解除回复，也不写 Maisaka 上下文。频率恢复
+        包括 Runner 异常后残留在记录里、但会话已不存在的聊天流；恢复失败的值仍
+        保留在记录中，可再次点击重试。
+        """
+        if action_id != _WIDGET_UNMUTE_ALL:
+            raise ValueError(f"未知配置页操作: {action_id}")
+        if self._unloading:
+            raise RuntimeError("插件正在卸载，请稍后重试")
+        group_ids = list(self._mute_status.export_sessions())
+        for group_id in group_ids:
+            self._terminate_mute_session(group_id)
+        if group_ids:
+            logger.info("[mute_guard] 已通过配置页解除 %d 个群的静音", len(group_ids))
+        tasks = []
+        for stream_id in list(self._frequency_restore_values):
+            task = asyncio.create_task(self._restore_frequency_serialized(stream_id))
+            self._frequency_tasks.add(task)
+            task.add_done_callback(self._frequency_tasks.discard)
+            tasks.append(task)
+        if tasks:
+            # asyncio.wait 超时或自身被取消都不会取消这些任务，恢复照常在后台完成。
+            await asyncio.wait(tasks, timeout=_WIDGET_RESTORE_WAIT_SECONDS)
 
     def _spawn_peek_mode_entry(self, stream_id: str, group_id: str, *, label: str) -> None:
         """后台进入纯窥屏模式，避免控制指令 Hook 等待频率 RPC。"""
